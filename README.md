@@ -1,24 +1,21 @@
-# labelmed-py
+# didascalie
 
-Python library for creating and manipulating LabelMed annotation files (`.labelmed`).
+Python library for creating and manipulating Didascalie annotation files (`.dida`).
 
 ## Installation
 
+Didascalie is not published to PyPI. Install it directly from GitHub:
+
 ```bash
-pip install labelmed
+pip install git+https://github.com/ClementPla/pydidascalie.git
 ```
 
-With optional dependencies:
+Or clone the repository and install locally:
 
 ```bash
-# For DICOM support
-pip install labelmed[dicom]
-
-# For COCO/YOLO converters
-pip install labelmed[converters]
-
-# Everything
-pip install labelmed[all]
+git clone https://github.com/ClementPla/pydidascalie.git
+cd pydidascalie
+pip install .
 ```
 
 ## Quick Start
@@ -26,10 +23,10 @@ pip install labelmed[all]
 ### Create a New Project
 
 ```python
-from labelmed import LabelMedProject, Label
+from didascalie import DidascalieProject, Label
 
 # Create a new project
-with LabelMedProject.create("dataset.labelmed", name="My Dataset") as project:
+with DidascalieProject.create("dataset.dida", name="My Dataset") as project:
     # Add labels
     project.add_label(Label(name="tumor", color="#FF0000"))
     project.add_label(Label(name="background", color="#00FF00"))
@@ -43,9 +40,9 @@ with LabelMedProject.create("dataset.labelmed", name="My Dataset") as project:
 
 ```python
 import numpy as np
-from labelmed import LabelMedProject, Label
+from didascalie import DidascalieProject, Label
 
-with LabelMedProject.create("annotated.labelmed") as project:
+with DidascalieProject.create("annotated.dida") as project:
     project.add_label(Label(name="lesion", color="#FF0000"))
     
     # Load your existing mask (H x W, values 0 or 255)
@@ -62,10 +59,10 @@ with LabelMedProject.create("annotated.labelmed") as project:
 ### Convert from COCO Format
 
 ```python
-from labelmed import LabelMedProject
-from labelmed.converters.coco import import_coco
+from didascalie import DidascalieProject
+from didascalie.converters.coco import import_coco
 
-with LabelMedProject.create("from_coco.labelmed") as project:
+with DidascalieProject.create("from_coco.dida") as project:
     stats = import_coco(
         project,
         coco_json="annotations.json",
@@ -77,9 +74,9 @@ with LabelMedProject.create("from_coco.labelmed") as project:
 ### Read Existing Project
 
 ```python
-from labelmed import LabelMedProject
+from didascalie import DidascalieProject
 
-with LabelMedProject("existing.labelmed") as project:
+with DidascalieProject("existing.dida") as project:
     print(f"Project: {project.config.name}")
     print(f"Labels: {[l.name for l in project.get_labels()]}")
     print(f"Frames: {project.get_frame_count()}")
@@ -98,10 +95,10 @@ with LabelMedProject("existing.labelmed") as project:
 ### Export to COCO Format
 
 ```python
-from labelmed import LabelMedProject
-from labelmed.converters.coco import export_coco
+from didascalie import DidascalieProject
+from didascalie.converters.coco import export_coco
 
-with LabelMedProject("my_project.labelmed") as project:
+with DidascalieProject("my_project.dida") as project:
     stats = export_coco(
         project,
         output_json="output_coco.json",
@@ -111,9 +108,10 @@ with LabelMedProject("my_project.labelmed") as project:
 
 ## API Reference
 
-### LabelMedProject
+### DidascalieProject
 
-The main class for working with LabelMed projects.
+The main class for working with Didascalie projects. `LabelMedProject` is kept as a
+deprecated alias for backwards compatibility with code written before the rebrand.
 
 #### Class Methods
 
@@ -181,7 +179,7 @@ class Frame:
 
 ## File Format
 
-LabelMed uses SQLite for storage. The `.labelmed` file contains:
+Didascalie uses SQLite for storage. The `.dida` file contains:
 
 - **project** - Project configuration (JSON)
 - **labels** - Label definitions
@@ -189,6 +187,8 @@ LabelMed uses SQLite for storage. The `.labelmed` file contains:
 - **frames** - Individual images (can be embedded or referenced)
 - **annotations** - Segmentation masks (RLE encoded)
 - **classifications** - Classification labels
+
+Legacy `.labelmed` files can still be opened for backwards compatibility.
 
 ## License
 
