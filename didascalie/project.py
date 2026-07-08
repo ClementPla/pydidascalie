@@ -342,6 +342,7 @@ class DidascalieProject:
         frame_index: Optional[int] = None,
         relative_path: Optional[str] = None,
         embed: bool = True,
+        format: str = "PNG",
     ) -> int:
         """
         Add a frame to a sequence.
@@ -398,7 +399,7 @@ class DidascalieProject:
             # Convert to RGB if needed for PNG
             if img.mode not in ("RGB", "RGBA", "L"):
                 img = img.convert("RGB")
-            img.save(buffer, format="PNG")
+            img.save(buffer, format=format)
             embedded_data = buffer.getvalue()
             content_hash = hashlib.sha256(embedded_data).hexdigest()
 
