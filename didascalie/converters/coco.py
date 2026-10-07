@@ -46,65 +46,66 @@ def import_coco(
         label_map[cat["id"]] = label.id
         stats["labels"] += 1
 
-    # Import images and annotations
-    for img_info in coco.imgs.values():
-        img_path = images_folder / img_info["file_name"]
+    # Import images and annotations (one transaction for the whole import)
+    with project.bulk():
+        for img_info in coco.imgs.values():
+            img_path = images_folder / img_info["file_name"]
 
-        if not img_path.exists():
-            stats["errors"].append(f"Image not found: {img_path}")
-            continue
+            if not img_path.exists():
+                stats["errors"].append(f"Image not found: {img_path}")
+                continue
 
-        try:
-            # Create sequence and frame
-            sequence = project.get_or_create_sequence(img_path.stem)
-            frame_id = project.add_frame(sequence.id, img_path, embed=embed)
-            stats["frames"] += 1
+            try:
+                # Create sequence and frame
+                sequence = project.get_or_create_sequence(img_path.stem)
+                frame_id = project.add_frame(sequence.id, img_path, embed=embed)
+                stats["frames"] += 1
 
-            # Get annotations for this image
-            ann_ids = coco.getAnnIds(imgIds=img_info["id"])
-            anns = coco.loadAnns(ann_ids)
+                # Get annotations for this image
+                ann_ids = coco.getAnnIds(imgIds=img_info["id"])
+                anns = coco.loadAnns(ann_ids)
 
-            # Group by category (merge instances for semantic segmentation)
-            masks_by_label: dict[int, np.ndarray] = {}
+                # Group by category (merge instances for semantic segmentation)
+                masks_by_label: dict[int, np.ndarray] = {}
 
-            for ann in anns:
-                cat_id = ann["category_id"]
-                label_id = label_map.get(cat_id)
+                for ann in anns:
+                    cat_id = ann["category_id"]
+                    label_id = label_map.get(cat_id)
 
-                if label_id is None:
-                    continue
-
-                # Decode mask
-                if "segmentation" in ann:
-                    if isinstance(ann["segmentation"], dict):
-                        # RLE format
-                        mask = coco_mask.decode(ann["segmentation"])
-                    elif isinstance(ann["segmentation"], list):
-                        # Polygon format
-                        rles = coco_mask.frPyObjects(
-                            ann["segmentation"],
-                            img_info["height"],
-                            img_info["width"],
-                        )
-                        mask = coco_mask.decode(coco_mask.merge(rles))
-                    else:
+                    if label_id is None:
                         continue
 
-                    # Merge with existing mask for this label
-                    if label_id in masks_by_label:
-                        masks_by_label[label_id] = np.maximum(
-                            masks_by_label[label_id], mask
-                        )
-                    else:
-                        masks_by_label[label_id] = mask
+                    # Decode mask
+                    if "segmentation" in ann:
+                        if isinstance(ann["segmentation"], dict):
+                            # RLE format
+                            mask = coco_mask.decode(ann["segmentation"])
+                        elif isinstance(ann["segmentation"], list):
+                            # Polygon format
+                            rles = coco_mask.frPyObjects(
+                                ann["segmentation"],
+                                img_info["height"],
+                                img_info["width"],
+                            )
+                            mask = coco_mask.decode(coco_mask.merge(rles))
+                        else:
+                            continue
 
-            # Save annotations
-            for label_id, mask in masks_by_label.items():
-                project.add_annotation(frame_id, label_id, mask * 255)
-                stats["annotations"] += 1
+                        # Merge with existing mask for this label
+                        if label_id in masks_by_label:
+                            masks_by_label[label_id] = np.maximum(
+                                masks_by_label[label_id], mask
+                            )
+                        else:
+                            masks_by_label[label_id] = mask
 
-        except Exception as e:
-            stats["errors"].append(f"{img_path}: {e}")
+                # Save annotations
+                for label_id, mask in masks_by_label.items():
+                    project.add_annotation(frame_id, label_id, mask * 255)
+                    stats["annotations"] += 1
+
+            except Exception as e:
+                stats["errors"].append(f"{img_path}: {e}")
 
     return stats
 

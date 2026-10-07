@@ -7,6 +7,12 @@ from pathlib import Path
 from typing import Optional, Union, Iterator
 import json
 import io
+import os
+import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from typing import Iterable
 
 import numpy as np
 from PIL import Image
@@ -22,6 +28,74 @@ from .models import (
     TextDescription,
 )
 from .encoding import rle_encode, rle_decode, mask_to_png_bytes, png_bytes_to_mask, rle_encode_fast
+
+
+def _encode_image(
+    image: Union[str, Path, np.ndarray, Image.Image],
+    relative_path: Optional[str],
+    embed: bool,
+    format: str,
+) -> tuple[Optional[str], Optional[str], Optional[bytes], int, int]:
+    """
+    Everything a ``frames`` row needs from an image:
+    ``(relative_path, content_hash, embedded_data, width, height)``.
+
+    Touches no database, so it can run on a worker thread.
+    """
+    if isinstance(image, (str, Path)):
+        img = Image.open(image)
+        if relative_path is None:
+            relative_path = str(Path(image).name)
+    elif isinstance(image, np.ndarray):
+        # Handle different array formats
+        if image.ndim == 2:
+            img = Image.fromarray(image)
+        elif image.ndim == 3:
+            if image.shape[2] == 3:
+                img = Image.fromarray(image, mode="RGB")
+            elif image.shape[2] == 4:
+                img = Image.fromarray(image, mode="RGBA")
+            else:
+                raise ValueError(f"Unsupported array shape: {image.shape}")
+        else:
+            raise ValueError(f"Unsupported array dimensions: {image.ndim}")
+    elif isinstance(image, Image.Image):
+        img = image
+    else:
+        raise TypeError(f"Unsupported image type: {type(image)}")
+
+    width, height = img.size
+
+    embedded_data = None
+    content_hash = None
+
+    if embed:
+        buffer = io.BytesIO()
+        # Convert to RGB if needed for PNG
+        if img.mode not in ("RGB", "RGBA", "L"):
+            img = img.convert("RGB")
+        img.save(buffer, format=format)
+        embedded_data = buffer.getvalue()
+        content_hash = hashlib.sha256(embedded_data).hexdigest()
+
+    return relative_path, content_hash, embedded_data, width, height
+
+
+def _imap_ordered(pool, fn, items, pending: deque, lookahead: int):
+    """
+    ``map(fn, items)`` on ``pool``, in order, reading at most ``lookahead``
+    items ahead of the one being yielded (``Executor.map`` reads them all up
+    front, which for a video means holding every frame in memory).
+
+    ``pending`` holds the futures still in flight, for the caller to cancel if
+    it stops early.
+    """
+    for item in items:
+        pending.append(pool.submit(fn, item))
+        if len(pending) >= lookahead:
+            yield pending.popleft().result()
+    while pending:
+        yield pending.popleft().result()
 
 
 class DidascalieProject:
@@ -42,10 +116,11 @@ class DidascalieProject:
         if not self.db_path.exists():
             raise FileNotFoundError(f"Project not found: {db_path}")
 
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._connection = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._config: Optional[ProjectConfig] = None
+        self._bulk_depth = 0
         self._check_schema_version()
 
     @property
@@ -67,7 +142,7 @@ class DidascalieProject:
         version = self.schema_version
         if version == 0:
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            self._conn.commit()
+            self._commit()
             return
         if version > SCHEMA_VERSION:
             raise ValueError(
@@ -129,17 +204,67 @@ class DidascalieProject:
 
         return cls(path)
 
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        if self._connection is None:
+            raise RuntimeError(
+                f"{self.db_path} is closed (close() was called, or a `with project:` "
+                f"block has exited). Reopen it with DidascalieProject(path)."
+            )
+        return self._connection
+
     def close(self) -> None:
         """Close the database connection."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        if self._connection:
+            self._connection.close()
+            self._connection = None
 
     def __enter__(self) -> "DidascalieProject":
         return self
 
     def __exit__(self, *args) -> None:
         self.close()
+
+    # ==========================================
+    # Transactions
+    # ==========================================
+
+    def _commit(self) -> None:
+        """Commit, unless a ``bulk()`` block is open (it commits once, on exit)."""
+        if self._bulk_depth == 0:
+            self._conn.commit()
+
+    @contextmanager
+    def bulk(self):
+        """
+        Group every write made inside the block into a single transaction.
+
+        Each write otherwise commits on its own, and a commit is a synchronous
+        write to disk: tens of milliseconds on a hard drive, which is most of
+        the time of an import. Inside the block nothing is committed until it
+        exits; if it raises, everything written in it is rolled back.
+
+        Blocks nest: only the outermost one commits or rolls back.
+
+        Example:
+            >>> with project.bulk():
+            ...     for image, masks in items:
+            ...         project.import_with_masks(image, masks, sequence_name="video")
+        """
+        self._bulk_depth += 1
+        try:
+            yield self
+        except BaseException:
+            # A closed project has nothing to roll back, and failing here
+            # would hide the error that got us here.
+            if self._bulk_depth == 1 and self._connection is not None:
+                self._connection.rollback()
+            raise
+        else:
+            if self._bulk_depth == 1:
+                self._conn.commit()
+        finally:
+            self._bulk_depth -= 1
 
     # ==========================================
     # Config
@@ -160,7 +285,7 @@ class DidascalieProject:
         self._conn.execute(
             "UPDATE project SET config = ? WHERE id = 1", (config.to_json(),)
         )
-        self._conn.commit()
+        self._commit()
         self._config = config
 
     # ==========================================
@@ -181,7 +306,7 @@ class DidascalieProject:
                VALUES (?, ?, ?, ?)""",
             (label.name, label.color, label.is_instance, label.sort_order),
         )
-        self._conn.commit()
+        self._commit()
         label.id = cursor.lastrowid
         return cursor.lastrowid
 
@@ -252,12 +377,12 @@ class DidascalieProject:
                WHERE id = ?""",
             (label.name, label.color, label.is_instance, label.sort_order, label.id),
         )
-        self._conn.commit()
+        self._commit()
 
     def delete_label(self, label_id: int) -> None:
         """Delete a label and its annotations."""
         self._conn.execute("DELETE FROM labels WHERE id = ?", (label_id,))
-        self._conn.commit()
+        self._commit()
 
     # ==========================================
     # Sequences
@@ -274,7 +399,7 @@ class DidascalieProject:
         cursor = self._conn.execute(
             "INSERT INTO sequences (name, sort_order) VALUES (?, ?)", (name, sort_order)
         )
-        self._conn.commit()
+        self._commit()
         return cursor.lastrowid
 
     def get_sequences(self) -> list[Sequence]:
@@ -329,7 +454,7 @@ class DidascalieProject:
     def delete_sequence(self, sequence_id: int) -> None:
         """Delete a sequence and all its frames."""
         self._conn.execute("DELETE FROM sequences WHERE id = ?", (sequence_id,))
-        self._conn.commit()
+        self._commit()
 
     # ==========================================
     # Frames
@@ -365,43 +490,9 @@ class DidascalieProject:
             ).fetchone()
             frame_index = row[0]
 
-        # Load image
-        if isinstance(image, (str, Path)):
-            img = Image.open(image)
-            if relative_path is None:
-                relative_path = str(Path(image).name)
-        elif isinstance(image, np.ndarray):
-            # Handle different array formats
-            if image.ndim == 2:
-                img = Image.fromarray(image)
-            elif image.ndim == 3:
-                if image.shape[2] == 3:
-                    img = Image.fromarray(image, mode="RGB")
-                elif image.shape[2] == 4:
-                    img = Image.fromarray(image, mode="RGBA")
-                else:
-                    raise ValueError(f"Unsupported array shape: {image.shape}")
-            else:
-                raise ValueError(f"Unsupported array dimensions: {image.ndim}")
-        elif isinstance(image, Image.Image):
-            img = image
-        else:
-            raise TypeError(f"Unsupported image type: {type(image)}")
-
-        width, height = img.size
-
-        # Prepare data
-        embedded_data = None
-        content_hash = None
-
-        if embed:
-            buffer = io.BytesIO()
-            # Convert to RGB if needed for PNG
-            if img.mode not in ("RGB", "RGBA", "L"):
-                img = img.convert("RGB")
-            img.save(buffer, format=format)
-            embedded_data = buffer.getvalue()
-            content_hash = hashlib.sha256(embedded_data).hexdigest()
+        relative_path, content_hash, embedded_data, width, height = _encode_image(
+            image, relative_path, embed, format
+        )
 
         # Insert
         cursor = self._conn.execute(
@@ -419,7 +510,7 @@ class DidascalieProject:
                 height,
             ),
         )
-        self._conn.commit()
+        self._commit()
         return cursor.lastrowid
 
     def get_frames(self, sequence_id: int) -> list[Frame]:
@@ -506,12 +597,12 @@ class DidascalieProject:
         self._conn.execute(
             "UPDATE frames SET reviewed = ? WHERE id = ?", (reviewed, frame_id)
         )
-        self._conn.commit()
+        self._commit()
 
     def delete_frame(self, frame_id: int) -> None:
         """Delete a frame and its annotations."""
         self._conn.execute("DELETE FROM frames WHERE id = ?", (frame_id,))
-        self._conn.commit()
+        self._commit()
 
     # ==========================================
     # Annotations
@@ -549,7 +640,7 @@ class DidascalieProject:
                VALUES (?, ?, ?, ?, datetime('now'))""",
             (frame_id, label_id, encoding, mask_data),
         )
-        self._conn.commit()
+        self._commit()
         return cursor.lastrowid
 
     def get_annotation(
@@ -630,7 +721,7 @@ class DidascalieProject:
             "DELETE FROM annotations WHERE frame_id = ? AND label_id = ?",
             (frame_id, label_id),
         )
-        self._conn.commit()
+        self._commit()
 
     # ==========================================
     # Classifications
@@ -650,7 +741,7 @@ class DidascalieProject:
                VALUES (?, ?, ?, ?, datetime('now'))""",
             (frame_id, task_name, json.dumps(selected_classes), is_multilabel),
         )
-        self._conn.commit()
+        self._commit()
         return cursor.lastrowid
 
     def get_classification(
@@ -696,7 +787,7 @@ class DidascalieProject:
             "DELETE FROM classifications WHERE frame_id = ? AND task_name = ?",
             (frame_id, task_name),
         )
-        self._conn.commit()
+        self._commit()
 
     # ==========================================
     # Text Descriptions
@@ -712,7 +803,7 @@ class DidascalieProject:
                VALUES (?, ?, ?, datetime('now'))""",
             (frame_id, label_name, content),
         )
-        self._conn.commit()
+        self._commit()
         return cursor.lastrowid
 
     def get_text_description(
@@ -749,6 +840,136 @@ class DidascalieProject:
             )
             for row in rows
         ]
+
+    # ==========================================
+    # Registrations (keypoint pairs between two frames)
+    # ==========================================
+
+    def _ensure_registration_tables(self) -> None:
+        """Projects written before registrations existed lack the tables; the
+        schema is all ``CREATE ... IF NOT EXISTS``, so re-applying it adds them."""
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'keypoint_pairs'"
+        ).fetchone()
+        if exists is None:
+            for statement in SCHEMA.split(";"):
+                if statement.strip():
+                    self._conn.execute(statement)
+
+    def add_registration(
+        self,
+        reference_frame_id: int,
+        moving_frame_id: int,
+        pairs,
+        homography: Optional[list[float]] = None,
+        transform_type: str = "homography",
+    ) -> int:
+        """
+        Store keypoint correspondences between two frames of a sequence, as the
+        application's registration view does (it lists them as a case of that
+        sequence and shows the pairs on the two frames).
+
+        Replaces the pairs of an existing registration of the same two frames.
+
+        Args:
+            reference_frame_id: Frame the ``ref`` points are on
+            moving_frame_id: Frame the ``moving`` points are on (another frame
+                of the same sequence)
+            pairs: ``(N, 4)`` array-like of ``(ref_x, ref_y, moving_x, moving_y)``
+                in pixels, sub-pixel allowed
+            homography: Optional 3x3 homography, 9 floats row-major
+            transform_type: Transform the application fits to the pairs
+
+        Returns:
+            Registration ID
+        """
+        pairs = np.asarray(pairs, dtype=float).reshape(-1, 4)
+        if not np.isfinite(pairs).all():
+            raise ValueError("Keypoint coordinates must be finite")
+        if homography is not None:
+            homography = [float(v) for v in np.asarray(homography).ravel()]
+            if len(homography) != 9:
+                raise ValueError("homography must hold 9 values")
+
+        rows = self._conn.execute(
+            "SELECT id, sequence_id FROM frames WHERE id IN (?, ?)",
+            (reference_frame_id, moving_frame_id),
+        ).fetchall()
+        sequences = {row["id"]: row["sequence_id"] for row in rows}
+        if len(sequences) != 2:
+            raise ValueError("A registration needs two distinct, existing frames")
+        if len(set(sequences.values())) != 1:
+            raise ValueError("Both frames must belong to the same sequence")
+
+        with self.bulk():
+            self._ensure_registration_tables()
+            self._conn.execute(
+                """INSERT INTO registrations
+                   (sequence_id, reference_frame_id, moving_frame_id, homography,
+                    transform_type, modified_at)
+                   VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(reference_frame_id, moving_frame_id)
+                   DO UPDATE SET
+                      homography = excluded.homography,
+                      transform_type = excluded.transform_type,
+                      modified_at = CURRENT_TIMESTAMP""",
+                (
+                    sequences[reference_frame_id],
+                    reference_frame_id,
+                    moving_frame_id,
+                    json.dumps(homography),
+                    transform_type,
+                ),
+            )
+            registration_id = self._conn.execute(
+                """SELECT id FROM registrations
+                   WHERE reference_frame_id = ? AND moving_frame_id = ?""",
+                (reference_frame_id, moving_frame_id),
+            ).fetchone()[0]
+            self._conn.execute(
+                "DELETE FROM keypoint_pairs WHERE registration_id = ?", (registration_id,)
+            )
+            self._conn.executemany(
+                """INSERT INTO keypoint_pairs
+                   (registration_id, client_uuid, ref_x, ref_y, moving_x, moving_y,
+                    sort_order, modified_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                [
+                    (registration_id, str(uuid.uuid4()), *map(float, pair), idx)
+                    for idx, pair in enumerate(pairs)
+                ],
+            )
+        return registration_id
+
+    def get_registrations(self, sequence_id: int) -> list[dict]:
+        """
+        Registrations of a sequence, each as a dict with ``reference_frame_id``,
+        ``moving_frame_id``, ``transform_type``, ``homography`` (9 floats or
+        None) and ``pairs``, an ``(N, 4)`` array of
+        ``(ref_x, ref_y, moving_x, moving_y)``.
+        """
+        self._ensure_registration_tables()
+        out = []
+        for row in self._conn.execute(
+            """SELECT id, reference_frame_id, moving_frame_id, homography, transform_type
+               FROM registrations WHERE sequence_id = ? ORDER BY id""",
+            (sequence_id,),
+        ).fetchall():
+            pairs = self._conn.execute(
+                """SELECT ref_x, ref_y, moving_x, moving_y FROM keypoint_pairs
+                   WHERE registration_id = ? ORDER BY sort_order""",
+                (row["id"],),
+            ).fetchall()
+            out.append(
+                {
+                    "reference_frame_id": row["reference_frame_id"],
+                    "moving_frame_id": row["moving_frame_id"],
+                    "transform_type": row["transform_type"],
+                    "homography": json.loads(row["homography"] or "null"),
+                    "pairs": np.array([tuple(p) for p in pairs], dtype=float).reshape(-1, 4),
+                }
+            )
+        return out
 
     # ==========================================
     # Bulk Import
@@ -799,29 +1020,30 @@ class DidascalieProject:
 
             images.setdefault(seq_name, []).append(path)
 
-        # Sort and import
-        for seq_name in sorted(images.keys()):
-            paths = sorted(images[seq_name])
+        # Sort and import, in a single transaction
+        with self.bulk():
+            for seq_name in sorted(images.keys()):
+                paths = sorted(images[seq_name])
 
-            try:
-                seq_id = self.add_sequence(seq_name)
-                stats["sequences"] += 1
+                try:
+                    seq_id = self.add_sequence(seq_name)
+                    stats["sequences"] += 1
 
-                for idx, img_path in enumerate(paths):
-                    try:
-                        self.add_frame(
-                            sequence_id=seq_id,
-                            image=img_path,
-                            frame_index=idx,
-                            relative_path=str(img_path.relative_to(folder)),
-                            embed=embed,
-                        )
-                        stats["frames"] += 1
-                    except Exception as e:
-                        stats["errors"].append(f"{img_path}: {e}")
+                    for idx, img_path in enumerate(paths):
+                        try:
+                            self.add_frame(
+                                sequence_id=seq_id,
+                                image=img_path,
+                                frame_index=idx,
+                                relative_path=str(img_path.relative_to(folder)),
+                                embed=embed,
+                            )
+                            stats["frames"] += 1
+                        except Exception as e:
+                            stats["errors"].append(f"{img_path}: {e}")
 
-            except Exception as e:
-                stats["errors"].append(f"Sequence {seq_name}: {e}")
+                except Exception as e:
+                    stats["errors"].append(f"Sequence {seq_name}: {e}")
 
         return stats
 
@@ -855,29 +1077,113 @@ class DidascalieProject:
             else:
                 sequence_name = f"image_{self.get_frame_count()}"
 
-        # Get or create sequence
-        sequence = self.get_or_create_sequence(sequence_name)
+        # One transaction for the frame and everything attached to it
+        with self.bulk():
+            # Get or create sequence
+            sequence = self.get_or_create_sequence(sequence_name)
 
-        # Add frame
-        frame_id = self.add_frame(sequence.id, image, embed=embed)
+            # Add frame
+            frame_id = self.add_frame(sequence.id, image, embed=embed)
 
-        # Add masks
-        for label_name, mask in masks.items():
-            label = self.get_or_create_label(label_name)
-            self.add_annotation(frame_id, label.id, mask)
+            # Add masks
+            for label_name, mask in masks.items():
+                label = self.get_or_create_label(label_name)
+                self.add_annotation(frame_id, label.id, mask)
 
-        # Add classifications
-        if classification:
-            for task_name, classes in classification.items():
-                is_multilabel = len(classes) > 1
-                self.add_classification(frame_id, task_name, classes, is_multilabel)
+            # Add classifications
+            if classification:
+                for task_name, classes in classification.items():
+                    is_multilabel = len(classes) > 1
+                    self.add_classification(frame_id, task_name, classes, is_multilabel)
 
-        # Add text descriptions
-        if text_descriptions:
-            for label_name, text in text_descriptions.items():
-                self.add_text_description(frame_id, label_name, text)
+            # Add text descriptions
+            if text_descriptions:
+                for label_name, text in text_descriptions.items():
+                    self.add_text_description(frame_id, label_name, text)
 
         return frame_id
+
+    def import_sequence(
+        self,
+        name: str,
+        frames: Iterable,
+        embed: bool = True,
+        format: str = "PNG",
+        workers: Optional[int] = None,
+    ) -> list[int]:
+        """
+        Import a whole sequence (a video, a volume) in one go.
+
+        The fast path for many frames: images and masks are encoded on a thread
+        pool and everything is written in a single transaction, so either the
+        whole sequence is imported or, if anything fails, none of it.
+
+        Args:
+            name: Sequence name; frames are appended if it already exists
+            frames: Iterable of images, or of ``(image, masks)`` pairs where
+                ``masks`` maps label_name -> mask_array. Consumed lazily, a few
+                frames ahead of the writes, so it can be a generator.
+            embed: Embed images in database
+            format: Format of the embedded images
+            workers: Encoding threads (defaults to the CPU count, at most 8)
+
+        Returns:
+            Frame IDs, in order
+        """
+        if workers is None:
+            workers = min(8, os.cpu_count() or 1)
+
+        def encode(item):
+            image, masks = item if isinstance(item, tuple) else (item, None)
+            return (
+                _encode_image(image, None, embed, format),
+                {k: rle_encode_fast(np.asarray(m)) for k, m in (masks or {}).items()},
+            )
+
+        frame_ids = []
+        label_ids: dict[str, int] = {}
+        with self.bulk(), ThreadPoolExecutor(max_workers=workers) as pool:
+            sequence_id = self.get_or_create_sequence(name).id
+            frame_index = self._conn.execute(
+                "SELECT COALESCE(MAX(frame_index), -1) + 1 FROM frames WHERE sequence_id = ?",
+                (sequence_id,),
+            ).fetchone()[0]
+
+            pending: deque = deque()
+            try:
+                for encoded in _imap_ordered(pool, encode, frames, pending, 2 * workers):
+                    (relative_path, content_hash, data, width, height), masks = encoded
+                    frame_id = self._conn.execute(
+                        """INSERT INTO frames
+                           (sequence_id, frame_index, relative_path, content_hash,
+                            embedded_data, width, height, reviewed)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
+                        (
+                            sequence_id,
+                            frame_index,
+                            relative_path,
+                            content_hash,
+                            data,
+                            width,
+                            height,
+                        ),
+                    ).lastrowid
+                    for label_name, mask_data in masks.items():
+                        if label_name not in label_ids:
+                            label_ids[label_name] = self.get_or_create_label(label_name).id
+                        self._conn.execute(
+                            """INSERT OR REPLACE INTO annotations
+                               (frame_id, label_id, encoding, mask_data, modified_at)
+                               VALUES (?, ?, 'rle', ?, datetime('now'))""",
+                            (frame_id, label_ids[label_name], mask_data),
+                        )
+                    frame_ids.append(frame_id)
+                    frame_index += 1
+            finally:
+                for future in pending:
+                    future.cancel()
+
+        return frame_ids
 
     # ==========================================
     # Iteration

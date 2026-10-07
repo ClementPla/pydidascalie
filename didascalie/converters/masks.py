@@ -48,54 +48,55 @@ def import_image_mask_pairs(
     # Get or create label
     label = project.get_or_create_label(label_name, label_color)
 
-    # Find image files
-    for img_path in sorted(images_folder.glob("*")):
-        if not img_path.is_file():
-            continue
-        if not regex.search(img_path.name):
-            continue
+    # Find image files (one transaction for the whole import)
+    with project.bulk():
+        for img_path in sorted(images_folder.glob("*")):
+            if not img_path.is_file():
+                continue
+            if not regex.search(img_path.name):
+                continue
 
-        # Find corresponding mask
-        stem = img_path.stem
-        mask_path = None
+            # Find corresponding mask
+            stem = img_path.stem
+            mask_path = None
 
-        for ext in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
-            candidate = masks_folder / f"{stem}{mask_suffix}{ext}"
-            if candidate.exists():
-                mask_path = candidate
-                break
+            for ext in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
+                candidate = masks_folder / f"{stem}{mask_suffix}{ext}"
+                if candidate.exists():
+                    mask_path = candidate
+                    break
 
-        if mask_path is None:
-            stats["errors"].append(f"No mask found for {img_path.name}")
-            continue
+            if mask_path is None:
+                stats["errors"].append(f"No mask found for {img_path.name}")
+                continue
 
-        try:
-            # Create sequence and frame
-            sequence = project.get_or_create_sequence(stem)
-            frame_id = project.add_frame(
-                sequence.id,
-                img_path,
-                relative_path=str(img_path.relative_to(images_folder)),
-                embed=embed,
-            )
-            stats["frames"] += 1
+            try:
+                # Create sequence and frame
+                sequence = project.get_or_create_sequence(stem)
+                frame_id = project.add_frame(
+                    sequence.id,
+                    img_path,
+                    relative_path=str(img_path.relative_to(images_folder)),
+                    embed=embed,
+                )
+                stats["frames"] += 1
 
-            # Load and add mask
-            mask_img = Image.open(mask_path)
-            mask_arr = np.array(mask_img)
+                # Load and add mask
+                mask_img = Image.open(mask_path)
+                mask_arr = np.array(mask_img)
 
-            # Handle different mask formats
-            if mask_arr.ndim == 3:
-                # Use any non-zero channel
-                mask_arr = (mask_arr.any(axis=2) * 255).astype(np.uint8)
-            elif mask_arr.ndim == 2:
-                mask_arr = (mask_arr > 0).astype(np.uint8) * 255
+                # Handle different mask formats
+                if mask_arr.ndim == 3:
+                    # Use any non-zero channel
+                    mask_arr = (mask_arr.any(axis=2) * 255).astype(np.uint8)
+                elif mask_arr.ndim == 2:
+                    mask_arr = (mask_arr > 0).astype(np.uint8) * 255
 
-            project.add_annotation(frame_id, label.id, mask_arr)
-            stats["annotations"] += 1
+                project.add_annotation(frame_id, label.id, mask_arr)
+                stats["annotations"] += 1
 
-        except Exception as e:
-            stats["errors"].append(f"{img_path}: {e}")
+            except Exception as e:
+                stats["errors"].append(f"{img_path}: {e}")
 
     return stats
 
@@ -135,48 +136,49 @@ def import_multilabel_masks(
     for name, color in labels:
         label_objects[name] = project.get_or_create_label(name, color)
 
-    # Find image files
-    for img_path in sorted(images_folder.glob("*")):
-        if not img_path.is_file():
-            continue
-        if not regex.search(img_path.name):
-            continue
+    # Find image files (one transaction for the whole import)
+    with project.bulk():
+        for img_path in sorted(images_folder.glob("*")):
+            if not img_path.is_file():
+                continue
+            if not regex.search(img_path.name):
+                continue
 
-        stem = img_path.stem
+            stem = img_path.stem
 
-        try:
-            # Create sequence and frame
-            sequence = project.get_or_create_sequence(stem)
-            frame_id = project.add_frame(
-                sequence.id,
-                img_path,
-                relative_path=str(img_path.relative_to(images_folder)),
-                embed=embed,
-            )
-            stats["frames"] += 1
+            try:
+                # Create sequence and frame
+                sequence = project.get_or_create_sequence(stem)
+                frame_id = project.add_frame(
+                    sequence.id,
+                    img_path,
+                    relative_path=str(img_path.relative_to(images_folder)),
+                    embed=embed,
+                )
+                stats["frames"] += 1
 
-            # Load masks for each label
-            for label_name, label in label_objects.items():
-                mask_filename = mask_pattern.format(stem=stem, label=label_name)
-                mask_path = masks_folder / mask_filename
+                # Load masks for each label
+                for label_name, label in label_objects.items():
+                    mask_filename = mask_pattern.format(stem=stem, label=label_name)
+                    mask_path = masks_folder / mask_filename
 
-                if not mask_path.exists():
-                    continue
+                    if not mask_path.exists():
+                        continue
 
-                mask_img = Image.open(mask_path)
-                mask_arr = np.array(mask_img)
+                    mask_img = Image.open(mask_path)
+                    mask_arr = np.array(mask_img)
 
-                if mask_arr.ndim == 3:
-                    mask_arr = (mask_arr.any(axis=2) * 255).astype(np.uint8)
-                elif mask_arr.ndim == 2:
-                    mask_arr = (mask_arr > 0).astype(np.uint8) * 255
+                    if mask_arr.ndim == 3:
+                        mask_arr = (mask_arr.any(axis=2) * 255).astype(np.uint8)
+                    elif mask_arr.ndim == 2:
+                        mask_arr = (mask_arr > 0).astype(np.uint8) * 255
 
-                if mask_arr.max() > 0:
-                    project.add_annotation(frame_id, label.id, mask_arr)
-                    stats["annotations"] += 1
+                    if mask_arr.max() > 0:
+                        project.add_annotation(frame_id, label.id, mask_arr)
+                        stats["annotations"] += 1
 
-        except Exception as e:
-            stats["errors"].append(f"{img_path}: {e}")
+            except Exception as e:
+                stats["errors"].append(f"{img_path}: {e}")
 
     return stats
 
@@ -218,56 +220,57 @@ def import_indexed_masks(
     for pixel_value, (name, color) in class_mapping.items():
         label_objects[pixel_value] = project.get_or_create_label(name, color)
 
-    # Find image files
-    for img_path in sorted(images_folder.glob("*")):
-        if not img_path.is_file():
-            continue
-        if not regex.search(img_path.name):
-            continue
+    # Find image files (one transaction for the whole import)
+    with project.bulk():
+        for img_path in sorted(images_folder.glob("*")):
+            if not img_path.is_file():
+                continue
+            if not regex.search(img_path.name):
+                continue
 
-        stem = img_path.stem
+            stem = img_path.stem
 
-        # Find corresponding mask
-        mask_path = None
-        for ext in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
-            candidate = masks_folder / f"{stem}{mask_suffix}{ext}"
-            if candidate.exists():
-                mask_path = candidate
-                break
+            # Find corresponding mask
+            mask_path = None
+            for ext in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
+                candidate = masks_folder / f"{stem}{mask_suffix}{ext}"
+                if candidate.exists():
+                    mask_path = candidate
+                    break
 
-        if mask_path is None:
-            stats["errors"].append(f"No mask found for {img_path.name}")
-            continue
+            if mask_path is None:
+                stats["errors"].append(f"No mask found for {img_path.name}")
+                continue
 
-        try:
-            # Create sequence and frame
-            sequence = project.get_or_create_sequence(stem)
-            frame_id = project.add_frame(
-                sequence.id,
-                img_path,
-                relative_path=str(img_path.relative_to(images_folder)),
-                embed=embed,
-            )
-            stats["frames"] += 1
+            try:
+                # Create sequence and frame
+                sequence = project.get_or_create_sequence(stem)
+                frame_id = project.add_frame(
+                    sequence.id,
+                    img_path,
+                    relative_path=str(img_path.relative_to(images_folder)),
+                    embed=embed,
+                )
+                stats["frames"] += 1
 
-            # Load indexed mask
-            mask_img = Image.open(mask_path)
-            indexed_mask = np.array(mask_img)
+                # Load indexed mask
+                mask_img = Image.open(mask_path)
+                indexed_mask = np.array(mask_img)
 
-            if indexed_mask.ndim == 3:
-                # Convert to single channel
-                indexed_mask = indexed_mask[:, :, 0]
+                if indexed_mask.ndim == 3:
+                    # Convert to single channel
+                    indexed_mask = indexed_mask[:, :, 0]
 
-            # Extract binary mask for each class
-            for pixel_value, label in label_objects.items():
-                binary_mask = (indexed_mask == pixel_value).astype(np.uint8) * 255
+                # Extract binary mask for each class
+                for pixel_value, label in label_objects.items():
+                    binary_mask = (indexed_mask == pixel_value).astype(np.uint8) * 255
 
-                if binary_mask.max() > 0:
-                    project.add_annotation(frame_id, label.id, binary_mask)
-                    stats["annotations"] += 1
+                    if binary_mask.max() > 0:
+                        project.add_annotation(frame_id, label.id, binary_mask)
+                        stats["annotations"] += 1
 
-        except Exception as e:
-            stats["errors"].append(f"{img_path}: {e}")
+            except Exception as e:
+                stats["errors"].append(f"{img_path}: {e}")
 
     return stats
 
