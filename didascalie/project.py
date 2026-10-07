@@ -27,7 +27,39 @@ from .models import (
     Classification,
     TextDescription,
 )
-from .encoding import rle_encode, rle_decode, mask_to_png_bytes, png_bytes_to_mask, rle_encode_fast
+from .encoding import (
+    instance_mask,
+    mask_to_png_bytes,
+    png_bytes_to_mask,
+    rle8_decode,
+    rle8_encode,
+    rle_decode,
+)
+
+
+def _encode_mask(mask: np.ndarray, is_instance: bool) -> bytes:
+    """`rle8` bytes for a label's mask: instance ids, or 1 wherever it is set."""
+    if is_instance:
+        return rle8_encode(instance_mask(mask))
+    return rle8_encode(np.asarray(mask) > 0)
+
+
+def _decode_mask(
+    encoding: str, data: bytes, width: int, height: int, raw: bool
+) -> np.ndarray:
+    """
+    A stored mask as an array. With ``raw`` the stored values (instance ids)
+    are returned; otherwise the mask is binary, 0 or 255.
+    """
+    if encoding == "rle8":
+        values = rle8_decode(data, width, height)
+        return values if raw else (values > 0).astype(np.uint8) * 255
+    if encoding == "rle":
+        mask = rle_decode(data, width, height)
+    else:
+        mask = png_bytes_to_mask(data)
+    # The legacy encodings are binary: every pixel belongs to instance 1.
+    return (mask > 0).astype(np.uint8) if raw else mask
 
 
 def _encode_image(
@@ -613,7 +645,7 @@ class DidascalieProject:
         frame_id: int,
         label_id: int,
         mask: np.ndarray,
-        encoding: str = "rle",
+        encoding: str = "rle8",
     ) -> int:
         """
         Add a segmentation annotation.
@@ -621,18 +653,22 @@ class DidascalieProject:
         Args:
             frame_id: Frame ID
             label_id: Label ID
-            mask: Binary mask array (H x W), values 0 or 255 (or any non-zero)
-            encoding: Encoding type ('rle' or 'png')
+            mask: Mask array (H x W). For an instance label, the instance id of
+                each pixel (0 is background, ids go up to 255). Otherwise any
+                non-zero pixel belongs to the label.
+            encoding: 'rle8', the application's format, or 'png' (legacy)
 
         Returns:
             Annotation ID
         """
-        if encoding == "rle":
-            mask_data = rle_encode_fast(mask)
-        else:
-            label = self.get_label_by_id(label_id)
+        label = self.get_label_by_id(label_id)
+        if encoding == "rle8":
+            mask_data = _encode_mask(mask, bool(label and label.is_instance))
+        elif encoding == "png":
             color = label.color if label else "#FF0000"
             mask_data = mask_to_png_bytes(mask, color)
+        else:
+            raise ValueError(f"Unsupported encoding: {encoding!r}")
 
         cursor = self._conn.execute(
             """INSERT OR REPLACE INTO annotations
@@ -649,6 +685,7 @@ class DidascalieProject:
         label_id: int,
         width: int,
         height: int,
+        raw: bool = False,
     ) -> Optional[np.ndarray]:
         """
         Get annotation mask for a frame/label pair.
@@ -658,9 +695,12 @@ class DidascalieProject:
             label_id: Label ID
             width: Image width
             height: Image height
+            raw: Return the stored values, i.e. the instance ids of an instance
+                label (and 1 for a semantic one)
 
         Returns:
-            Binary mask array (H x W) with values 0 or 255, or None if not found
+            Mask array (H x W), or None if not found. Binary with values 0 or
+            255 unless ``raw`` is set.
         """
         row = self._conn.execute(
             "SELECT encoding, mask_data FROM annotations WHERE frame_id = ? AND label_id = ?",
@@ -670,17 +710,18 @@ class DidascalieProject:
         if row is None:
             return None
 
-        if row["encoding"] == "rle":
-            return rle_decode(row["mask_data"], width, height)
-        else:
-            return png_bytes_to_mask(row["mask_data"])
+        return _decode_mask(row["encoding"], row["mask_data"], width, height, raw)
 
-    def get_annotations_for_frame(self, frame_id: int) -> list[tuple[Label, np.ndarray]]:
+    def get_annotations_for_frame(
+        self, frame_id: int, raw: bool = False
+    ) -> list[tuple[Label, np.ndarray]]:
         """
         Get all annotations for a frame.
 
         Args:
             frame_id: Frame ID
+            raw: Return instance ids instead of binary masks (see
+                ``get_annotation``)
 
         Returns:
             List of (Label, mask) tuples
@@ -706,10 +747,9 @@ class DidascalieProject:
                 is_instance=bool(row["is_instance"]),
             )
 
-            if row["encoding"] == "rle":
-                mask = rle_decode(row["mask_data"], frame.width, frame.height)
-            else:
-                mask = png_bytes_to_mask(row["mask_data"])
+            mask = _decode_mask(
+                row["encoding"], row["mask_data"], frame.width, frame.height, raw
+            )
 
             results.append((label, mask))
 
@@ -1121,7 +1161,8 @@ class DidascalieProject:
         Args:
             name: Sequence name; frames are appended if it already exists
             frames: Iterable of images, or of ``(image, masks)`` pairs where
-                ``masks`` maps label_name -> mask_array. Consumed lazily, a few
+                ``masks`` maps label_name -> mask_array (instance ids for the
+                labels that already exist as instance labels). Consumed lazily, a few
                 frames ahead of the writes, so it can be a generator.
             embed: Embed images in database
             format: Format of the embedded images
@@ -1133,11 +1174,17 @@ class DidascalieProject:
         if workers is None:
             workers = min(8, os.cpu_count() or 1)
 
+        # Read before the workers start: they must not touch the connection.
+        instance_labels = {l.name for l in self.get_labels() if l.is_instance}
+
         def encode(item):
             image, masks = item if isinstance(item, tuple) else (item, None)
             return (
                 _encode_image(image, None, embed, format),
-                {k: rle_encode_fast(np.asarray(m)) for k, m in (masks or {}).items()},
+                {
+                    k: _encode_mask(np.asarray(m), k in instance_labels)
+                    for k, m in (masks or {}).items()
+                },
             )
 
         frame_ids = []
@@ -1174,7 +1221,7 @@ class DidascalieProject:
                         self._conn.execute(
                             """INSERT OR REPLACE INTO annotations
                                (frame_id, label_id, encoding, mask_data, modified_at)
-                               VALUES (?, ?, 'rle', ?, datetime('now'))""",
+                               VALUES (?, ?, 'rle8', ?, datetime('now'))""",
                             (frame_id, label_ids[label_name], mask_data),
                         )
                     frame_ids.append(frame_id)

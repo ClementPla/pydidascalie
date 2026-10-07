@@ -72,6 +72,60 @@ def rle_encode_fast(mask: np.ndarray) -> bytes:
     return run_lengths.astype('<u4').tobytes()
 
 
+# Value-aware RLE (`rle8`): the encoding the application writes.
+#
+# Unlike the binary codec above, it keeps the pixel value: 0 is background, 1 a
+# semantic label, and 1..255 the instance ids of an instance label. Runs are
+# stored row-major as `[value: u8][count: u32 little-endian]`.
+_RLE8_RUN = np.dtype([("value", "u1"), ("count", "<u4")])
+
+
+def rle8_encode(mask: np.ndarray) -> bytes:
+    """
+    Encode a uint8 value mask (H x W) as `rle8`.
+
+    The values are stored as they are, so pass 0/1 for a semantic label and
+    instance ids for an instance label.
+    """
+    flat = np.ascontiguousarray(mask, dtype=np.uint8).reshape(-1)
+    if flat.size == 0:
+        return b""
+
+    starts = np.concatenate([[0], np.flatnonzero(np.diff(flat)) + 1])
+    runs = np.empty(len(starts), dtype=_RLE8_RUN)
+    runs["value"] = flat[starts]
+    runs["count"] = np.diff(np.concatenate([starts, [flat.size]]))
+    return runs.tobytes()
+
+
+def rle8_decode(data: bytes, width: int, height: int) -> np.ndarray:
+    """Decode `rle8` data to a uint8 value mask (H x W)."""
+    total = width * height
+    runs = np.frombuffer(data, dtype=_RLE8_RUN, count=len(data) // _RLE8_RUN.itemsize)
+    flat = np.repeat(runs["value"], runs["count"])[:total]
+    if flat.size < total:
+        flat = np.concatenate([flat, np.zeros(total - flat.size, dtype=np.uint8)])
+    return flat.reshape((height, width))
+
+
+def instance_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Check an instance-id mask and return it as uint8.
+
+    Ids are stored in one byte per pixel, so a label holds at most 255
+    instances per frame.
+    """
+    mask = np.asarray(mask)
+    if mask.dtype == bool:
+        return mask.astype(np.uint8)
+    if mask.size and (mask.min() < 0 or mask.max() > 255):
+        raise ValueError(
+            "Instance ids must be between 0 and 255 "
+            f"(got {mask.min()}..{mask.max()}); renumber the instances of each frame."
+        )
+    return mask.astype(np.uint8)
+
+
 def rle_decode(data: bytes, width: int, height: int) -> np.ndarray:
     """
     Decode RLE data to binary mask (COCO-style column-major).

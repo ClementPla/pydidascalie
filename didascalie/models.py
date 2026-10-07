@@ -84,7 +84,7 @@ class Annotation:
     id: Optional[int] = None
     frame_id: int = 0
     label_id: int = 0
-    encoding: str = "rle"
+    encoding: str = "rle8"
     mask_data: bytes = b""
     modified_at: datetime = field(default_factory=datetime.now)
 

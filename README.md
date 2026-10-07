@@ -56,6 +56,28 @@ with DidascalieProject.create("annotated.dida") as project:
     )
 ```
 
+### Instance Segmentation
+
+A label created with `is_instance=True` stores an instance id per pixel: 0 is
+background, and ids go from 1 to 255 within each frame.
+
+```python
+import numpy as np
+from didascalie import DidascalieProject, Label, ProjectConfig
+
+config = ProjectConfig(instance_segmentation_enabled=True)
+with DidascalieProject.create("nuclei.dida", config=config) as project:
+    project.add_label(Label(name="nucleus", color="#FF0000", is_instance=True))
+
+    ids = np.load("instance_ids.npy")  # H x W, one id per nucleus
+    frame_id = project.import_with_masks(image="patch.png", masks={"nucleus": ids})
+
+    # Read the ids back; without raw=True the mask is binary (0 or 255)
+    label = project.get_label_by_name("nucleus")
+    height, width = ids.shape
+    ids = project.get_annotation(frame_id, label.id, width, height, raw=True)
+```
+
 ### Convert from COCO Format
 
 ```python
