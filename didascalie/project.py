@@ -17,13 +17,19 @@ from typing import Iterable
 import numpy as np
 from PIL import Image
 
-from .schema import SCHEMA, SCHEMA_VERSION
+from .schema import (
+    CREATE_SCHEMA_VERSION,
+    SCHEMA,
+    SCHEMA_V4,
+    SCHEMA_VERSION,
+    V3_PER_USER_TABLES,
+)
 from .models import (
     ProjectConfig,
+    User,
     Label,
     Sequence,
     Frame,
-    Annotation,
     Classification,
     TextDescription,
 )
@@ -141,8 +147,17 @@ class DidascalieProject:
         >>> project.close()
     """
 
-    def __init__(self, db_path: Union[str, Path]):
-        """Open an existing Didascalie project."""
+    def __init__(self, db_path: Union[str, Path], user: Union[int, str, None] = None):
+        """
+        Open an existing Didascalie project.
+
+        Args:
+            db_path: Path to the .dida file
+            user: Name or id of the account whose annotations are read and
+                written, for a project with user accounts. Defaults to its
+                first administrator, who owns what was annotated before
+                accounts existed.
+        """
         self.db_path = Path(db_path)
 
         if not self.db_path.exists():
@@ -154,6 +169,17 @@ class DidascalieProject:
         self._config: Optional[ProjectConfig] = None
         self._bulk_depth = 0
         self._check_schema_version()
+        # Since schema version 4, annotations, classifications, texts and
+        # reviews belong to a user. Both layouts are read and written.
+        self._user_scoped = self._has_column("annotations", "user_id")
+        self._user_id: Optional[int] = None
+        if self._user_scoped:
+            self.set_user(user)
+        elif user is not None:
+            raise ValueError(
+                f"{self.db_path} has no user accounts: it was last saved by a "
+                "version of Didascalie that predates them."
+            )
 
     @property
     def schema_version(self) -> int:
@@ -173,7 +199,7 @@ class DidascalieProject:
         """
         version = self.schema_version
         if version == 0:
-            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._conn.execute("PRAGMA user_version = 1")
             self._commit()
             return
         if version > SCHEMA_VERSION:
@@ -220,7 +246,7 @@ class DidascalieProject:
         conn.executescript(SCHEMA)
         # Stamp the schema version into the database header (SQLite user_version).
         # SCHEMA_VERSION is a trusted integer constant, so inlining it is safe.
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute(f"PRAGMA user_version = {CREATE_SCHEMA_VERSION}")
 
         # Insert config
         if config is None:
@@ -299,6 +325,146 @@ class DidascalieProject:
             self._bulk_depth -= 1
 
     # ==========================================
+    # Users
+    # ==========================================
+
+    def _has_column(self, table: str, column: str) -> bool:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(row["name"] == column for row in rows)
+
+    def _mine(self, alias: str = "") -> tuple[str, tuple]:
+        """SQL condition and parameter limiting a per-user table to the current
+        user; empty for a project without accounts."""
+        if not self._user_scoped:
+            return "", ()
+        return f" AND {alias}user_id = ?", (self._user_id,)
+
+    def _owner(self) -> tuple[str, str, tuple]:
+        """Column, placeholder and parameter that make an inserted row belong
+        to the current user; empty for a project without accounts."""
+        if not self._user_scoped:
+            return "", "", ()
+        return ", user_id", ", ?", (self._user_id,)
+
+    def _reviewed(self) -> tuple[str, tuple]:
+        """SQL expression (and its parameters) telling whether a row of
+        ``frames`` is reviewed, by the current user where there are accounts."""
+        if not self._user_scoped:
+            return "reviewed", ()
+        return (
+            "EXISTS (SELECT 1 FROM frame_reviews r"
+            " WHERE r.frame_id = frames.id AND r.user_id = ?)",
+            (self._user_id,),
+        )
+
+    def _mark_rle8(self) -> None:
+        """Masks are written as `rle8`, which the application reads from schema
+        version 3 on: stamp older files so that older builds refuse them
+        instead of misreading the masks."""
+        if self.schema_version < 3:
+            self._conn.execute("PRAGMA user_version = 3")
+
+    def get_users(self) -> list[User]:
+        """Accounts of the project; empty for a project without accounts."""
+        if not self._user_scoped:
+            return []
+        rows = self._conn.execute("SELECT id, name, role FROM users ORDER BY id").fetchall()
+        return [User(id=row["id"], name=row["name"], role=row["role"]) for row in rows]
+
+    @property
+    def user(self) -> Optional[User]:
+        """Account whose annotations are read and written (None without accounts)."""
+        return next((u for u in self.get_users() if u.id == self._user_id), None)
+
+    def set_user(self, user: Union[int, str, None] = None) -> None:
+        """
+        Choose whose annotations are read and written from now on.
+
+        Args:
+            user: Account name or id; None for the first administrator
+        """
+        if not self._user_scoped:
+            raise ValueError("This project has no user accounts")
+        users = self.get_users()
+        if user is None:
+            admins = [u for u in users if u.role == "admin"]
+            match = (admins or users or [None])[0]
+        elif isinstance(user, str):
+            match = next((u for u in users if u.name.lower() == user.lower()), None)
+        else:
+            match = next((u for u in users if u.id == user), None)
+        if match is None:
+            names = ", ".join(u.name for u in users)
+            raise ValueError(f"No such user: {user!r} (accounts: {names})")
+        self._user_id = match.id
+
+    def enable_user_accounts(self, owner: str = "Admin") -> User:
+        """
+        Give the project user accounts, as the application does the first time
+        it opens a project created before they existed.
+
+        Everything annotated so far goes to a first account, an administrator
+        named ``owner``, who becomes the current user. Further accounts are
+        added with ``add_user``.
+
+        The project then needs a version of Didascalie that has user accounts:
+        older ones refuse to open it.
+        """
+        if self._bulk_depth:
+            raise RuntimeError("enable_user_accounts() cannot run inside bulk()")
+        if not self._user_scoped:
+            old = [t for t in V3_PER_USER_TABLES if self._has_column(t, "id")]
+            script = ["BEGIN;"]
+            script += [f"ALTER TABLE {t} RENAME TO {t}_v3;" for t in old]
+            # The tables just moved aside, in their current shape, and account 1.
+            script.append(SCHEMA_V4)
+            for table in old:
+                columns = V3_PER_USER_TABLES[table]
+                script.append(
+                    f"INSERT INTO {table} ({columns}, user_id)"
+                    f" SELECT {columns}, 1 FROM {table}_v3;"
+                    f"DROP TABLE {table}_v3;"
+                )
+            # Once more for the indexes, which went with the dropped tables.
+            script.append(SCHEMA_V4)
+            script.append(
+                "INSERT OR IGNORE INTO frame_reviews (frame_id, user_id)"
+                " SELECT id, 1 FROM frames WHERE reviewed = 1;"
+                f"PRAGMA user_version = {SCHEMA_VERSION};"
+                "COMMIT;"
+            )
+            self._conn.commit()
+            try:
+                self._conn.executescript("\n".join(script))
+            except BaseException:
+                self._conn.rollback()
+                raise
+            self._user_scoped = True
+            self._conn.execute("UPDATE users SET name = ? WHERE id = 1", (owner,))
+            self._commit()
+        self.set_user(None)
+        return self.user
+
+    def add_user(self, name: str, role: str = "editor") -> User:
+        """
+        Add an account, e.g. to store a model's predictions next to the
+        annotators' work instead of over it. The account has no password.
+
+        Args:
+            name: Account name, unique in the project
+            role: 'editor' or 'admin'
+        """
+        if not self._user_scoped:
+            raise ValueError(
+                "This project has no user accounts: call enable_user_accounts() first"
+            )
+        cursor = self._conn.execute(
+            "INSERT INTO users (name, role) VALUES (?, ?)", (name, role)
+        )
+        self._commit()
+        return User(id=cursor.lastrowid, name=name, role=role)
+
+    # ==========================================
     # Config
     # ==========================================
 
@@ -320,12 +486,104 @@ class DidascalieProject:
         self._commit()
         self._config = config
 
+    def add_classification_task(
+        self, name: str, classes: list[str], default: Optional[str] = None
+    ) -> None:
+        """
+        Declare a multiclass task (one class per frame), or add classes to it.
+        The application only shows the tasks declared in the project.
+        """
+        config = self.config
+        if config.multilabel_task and config.multilabel_task["name"] == name:
+            raise ValueError(f"{name!r} is the multilabel task of this project")
+        tasks = list(config.classification_tasks or [])
+        task = next((t for t in tasks if t["name"] == name), None)
+        if task is None:
+            task = {"name": name, "classes": [], "default": default}
+            tasks.append(task)
+        elif default is not None:
+            task["default"] = default
+        task["classes"] = list(dict.fromkeys([*task["classes"], *classes]))
+        config.classification_tasks = tasks
+        config.classification_enabled = True
+        self.update_config(config)
+
+    def set_multilabel_task(
+        self, name: str, classes: list[str], default: Optional[list[str]] = None
+    ) -> None:
+        """
+        Declare the multilabel task (several classes per frame), or add classes
+        to it. A project has one multilabel task.
+        """
+        config = self.config
+        task = config.multilabel_task
+        if task is not None and task["name"] != name:
+            raise ValueError(
+                f"This project already has a multilabel task, {task['name']!r}; "
+                "the application supports one"
+            )
+        if any(t["name"] == name for t in config.classification_tasks or []):
+            raise ValueError(f"{name!r} is a multiclass task of this project")
+        if task is None:
+            task = {"name": name, "classes": [], "default": default}
+        elif default is not None:
+            task["default"] = default
+        task["classes"] = list(dict.fromkeys([*task["classes"], *classes]))
+        config.multilabel_task = task
+        config.classification_enabled = True
+        self.update_config(config)
+
+    def get_classification_tasks(self) -> dict[str, list[str]]:
+        """Declared tasks and their classes, the multilabel one included."""
+        config = self.config
+        tasks = {t["name"]: list(t["classes"]) for t in config.classification_tasks or []}
+        if config.multilabel_task:
+            tasks[config.multilabel_task["name"]] = list(config.multilabel_task["classes"])
+        return tasks
+
+    def add_text_field(self, name: str) -> None:
+        """Declare a free-text field, shown by the application on every frame."""
+        config = self.config
+        if name not in (config.text_fields or []):
+            config.text_fields = [*(config.text_fields or []), name]
+            config.text_description_enabled = True
+            self.update_config(config)
+
+    def _sync_label_config(self) -> None:
+        """
+        Mirror the labels table into the config of a project that lists its
+        labels there. The application treats that list as the reference when it
+        opens a project: a label missing from it is removed if nothing uses it.
+        """
+        config = self.config
+        if config.segmentation_labels is None:
+            return
+        shades = {l["name"]: l.get("shades") for l in config.segmentation_labels}
+        config.segmentation_labels = [
+            {"name": l.name, "color": l.color, "shades": shades.get(l.name)}
+            for l in self.get_labels()
+        ]
+        self.update_config(config)
+
     # ==========================================
     # Labels
     # ==========================================
 
     def add_label(self, label: Label) -> int:
-        """Add a label and return its ID."""
+        """
+        Add a label and return its ID.
+
+        Instance segmentation is a setting of the whole project: adding an
+        instance label turns it on, and in an instance project every label is
+        an instance label.
+        """
+        config = self.config
+        if config.instance_segmentation_enabled:
+            label.is_instance = True
+        elif label.is_instance:
+            config.instance_segmentation_enabled = True
+            self.update_config(config)
+
         # Get next sort order if not specified
         if label.sort_order == 0:
             row = self._conn.execute(
@@ -340,7 +598,8 @@ class DidascalieProject:
         )
         self._commit()
         label.id = cursor.lastrowid
-        return cursor.lastrowid
+        self._sync_label_config()
+        return label.id
 
     def get_labels(self) -> list[Label]:
         """Get all labels."""
@@ -410,11 +669,13 @@ class DidascalieProject:
             (label.name, label.color, label.is_instance, label.sort_order, label.id),
         )
         self._commit()
+        self._sync_label_config()
 
     def delete_label(self, label_id: int) -> None:
         """Delete a label and its annotations."""
         self._conn.execute("DELETE FROM labels WHERE id = ?", (label_id,))
         self._commit()
+        self._sync_label_config()
 
     # ==========================================
     # Sequences
@@ -547,12 +808,13 @@ class DidascalieProject:
 
     def get_frames(self, sequence_id: int) -> list[Frame]:
         """Get all frames in a sequence."""
+        reviewed, mine = self._reviewed()
         rows = self._conn.execute(
-            """SELECT id, sequence_id, frame_index, relative_path,
-                      content_hash, width, height, reviewed
-               FROM frames WHERE sequence_id = ?
-               ORDER BY frame_index""",
-            (sequence_id,),
+            f"""SELECT id, sequence_id, frame_index, relative_path,
+                       content_hash, width, height, {reviewed} AS reviewed
+                FROM frames WHERE sequence_id = ?
+                ORDER BY frame_index""",
+            (*mine, sequence_id),
         ).fetchall()
 
         return [
@@ -571,11 +833,12 @@ class DidascalieProject:
 
     def get_frame(self, frame_id: int) -> Optional[Frame]:
         """Get a frame by ID."""
+        reviewed, mine = self._reviewed()
         row = self._conn.execute(
-            """SELECT id, sequence_id, frame_index, relative_path,
-                      content_hash, width, height, reviewed
-               FROM frames WHERE id = ?""",
-            (frame_id,),
+            f"""SELECT id, sequence_id, frame_index, relative_path,
+                       content_hash, width, height, {reviewed} AS reviewed
+                FROM frames WHERE id = ?""",
+            (*mine, frame_id),
         ).fetchone()
 
         if row is None:
@@ -625,10 +888,21 @@ class DidascalieProject:
             raise ValueError("Frame has no embedded data and no input folder provided")
 
     def set_frame_reviewed(self, frame_id: int, reviewed: bool = True) -> None:
-        """Mark a frame as reviewed."""
-        self._conn.execute(
-            "UPDATE frames SET reviewed = ? WHERE id = ?", (reviewed, frame_id)
-        )
+        """Mark a frame as reviewed (by the current user, where there are accounts)."""
+        if not self._user_scoped:
+            self._conn.execute(
+                "UPDATE frames SET reviewed = ? WHERE id = ?", (reviewed, frame_id)
+            )
+        elif reviewed:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO frame_reviews (frame_id, user_id) VALUES (?, ?)",
+                (frame_id, self._user_id),
+            )
+        else:
+            self._conn.execute(
+                "DELETE FROM frame_reviews WHERE frame_id = ? AND user_id = ?",
+                (frame_id, self._user_id),
+            )
         self._commit()
 
     def delete_frame(self, frame_id: int) -> None:
@@ -664,17 +938,19 @@ class DidascalieProject:
         label = self.get_label_by_id(label_id)
         if encoding == "rle8":
             mask_data = _encode_mask(mask, bool(label and label.is_instance))
+            self._mark_rle8()
         elif encoding == "png":
             color = label.color if label else "#FF0000"
             mask_data = mask_to_png_bytes(mask, color)
         else:
             raise ValueError(f"Unsupported encoding: {encoding!r}")
 
+        column, placeholder, owner = self._owner()
         cursor = self._conn.execute(
-            """INSERT OR REPLACE INTO annotations
-               (frame_id, label_id, encoding, mask_data, modified_at)
-               VALUES (?, ?, ?, ?, datetime('now'))""",
-            (frame_id, label_id, encoding, mask_data),
+            f"""INSERT OR REPLACE INTO annotations
+                (frame_id, label_id, encoding, mask_data, modified_at{column})
+                VALUES (?, ?, ?, ?, datetime('now'){placeholder})""",
+            (frame_id, label_id, encoding, mask_data, *owner),
         )
         self._commit()
         return cursor.lastrowid
@@ -702,9 +978,11 @@ class DidascalieProject:
             Mask array (H x W), or None if not found. Binary with values 0 or
             255 unless ``raw`` is set.
         """
+        mine, user = self._mine()
         row = self._conn.execute(
-            "SELECT encoding, mask_data FROM annotations WHERE frame_id = ? AND label_id = ?",
-            (frame_id, label_id),
+            "SELECT encoding, mask_data FROM annotations"
+            f" WHERE frame_id = ? AND label_id = ?{mine}",
+            (frame_id, label_id, *user),
         ).fetchone()
 
         if row is None:
@@ -731,12 +1009,13 @@ class DidascalieProject:
             return []
 
         results = []
+        mine, user = self._mine("a.")
         rows = self._conn.execute(
-            """SELECT a.label_id, a.encoding, a.mask_data, l.name, l.color, l.is_instance
-               FROM annotations a
-               JOIN labels l ON l.id = a.label_id
-               WHERE a.frame_id = ?""",
-            (frame_id,),
+            f"""SELECT a.label_id, a.encoding, a.mask_data, l.name, l.color, l.is_instance
+                FROM annotations a
+                JOIN labels l ON l.id = a.label_id
+                WHERE a.frame_id = ?{mine}""",
+            (frame_id, *user),
         ).fetchall()
 
         for row in rows:
@@ -757,9 +1036,10 @@ class DidascalieProject:
 
     def delete_annotation(self, frame_id: int, label_id: int) -> None:
         """Delete an annotation."""
+        mine, user = self._mine()
         self._conn.execute(
-            "DELETE FROM annotations WHERE frame_id = ? AND label_id = ?",
-            (frame_id, label_id),
+            f"DELETE FROM annotations WHERE frame_id = ? AND label_id = ?{mine}",
+            (frame_id, label_id, *user),
         )
         self._commit()
 
@@ -772,14 +1052,44 @@ class DidascalieProject:
         frame_id: int,
         task_name: str,
         selected_classes: list[str],
-        is_multilabel: bool = False,
+        is_multilabel: Optional[bool] = None,
     ) -> int:
-        """Add a classification annotation."""
+        """
+        Add a classification annotation.
+
+        The task and the classes are declared in the project if they are not
+        already, so that the application shows them.
+
+        Args:
+            frame_id: Frame ID
+            task_name: Task the classes belong to
+            selected_classes: Chosen classes (one, for a multiclass task)
+            is_multilabel: Kind of a task that is not declared yet. By default
+                a task given several classes is the multilabel task.
+        """
+        selected_classes = list(selected_classes)
+        config = self.config
+        declared = config.multilabel_task and config.multilabel_task["name"] == task_name
+        if declared or any(t["name"] == task_name for t in config.classification_tasks or []):
+            is_multilabel = bool(declared)
+        elif is_multilabel is None:
+            is_multilabel = len(selected_classes) > 1
+        if not is_multilabel and len(selected_classes) > 1:
+            raise ValueError(
+                f"{task_name!r} is a multiclass task: it takes one class per frame"
+            )
+        if not set(selected_classes) <= set(self.get_classification_tasks().get(task_name, [])):
+            if is_multilabel:
+                self.set_multilabel_task(task_name, selected_classes)
+            else:
+                self.add_classification_task(task_name, selected_classes)
+
+        column, placeholder, owner = self._owner()
         cursor = self._conn.execute(
-            """INSERT OR REPLACE INTO classifications
-               (frame_id, task_name, selected_classes, is_multilabel, modified_at)
-               VALUES (?, ?, ?, ?, datetime('now'))""",
-            (frame_id, task_name, json.dumps(selected_classes), is_multilabel),
+            f"""INSERT OR REPLACE INTO classifications
+                (frame_id, task_name, selected_classes, is_multilabel, modified_at{column})
+                VALUES (?, ?, ?, ?, datetime('now'){placeholder})""",
+            (frame_id, task_name, json.dumps(selected_classes), is_multilabel, *owner),
         )
         self._commit()
         return cursor.lastrowid
@@ -788,9 +1098,10 @@ class DidascalieProject:
         self, frame_id: int, task_name: str
     ) -> Optional[Classification]:
         """Get classification for a frame/task pair."""
+        mine, user = self._mine()
         row = self._conn.execute(
-            "SELECT * FROM classifications WHERE frame_id = ? AND task_name = ?",
-            (frame_id, task_name),
+            f"SELECT * FROM classifications WHERE frame_id = ? AND task_name = ?{mine}",
+            (frame_id, task_name, *user),
         ).fetchone()
 
         if row is None:
@@ -806,8 +1117,9 @@ class DidascalieProject:
 
     def get_classifications_for_frame(self, frame_id: int) -> list[Classification]:
         """Get all classifications for a frame."""
+        mine, user = self._mine()
         rows = self._conn.execute(
-            "SELECT * FROM classifications WHERE frame_id = ?", (frame_id,)
+            f"SELECT * FROM classifications WHERE frame_id = ?{mine}", (frame_id, *user)
         ).fetchall()
 
         return [
@@ -823,9 +1135,10 @@ class DidascalieProject:
 
     def delete_classification(self, frame_id: int, task_name: str) -> None:
         """Delete a classification."""
+        mine, user = self._mine()
         self._conn.execute(
-            "DELETE FROM classifications WHERE frame_id = ? AND task_name = ?",
-            (frame_id, task_name),
+            f"DELETE FROM classifications WHERE frame_id = ? AND task_name = ?{mine}",
+            (frame_id, task_name, *user),
         )
         self._commit()
 
@@ -836,12 +1149,15 @@ class DidascalieProject:
     def add_text_description(
         self, frame_id: int, label_name: str, content: str
     ) -> int:
-        """Add a text description."""
+        """Add a text description. The field is declared in the project if it
+        is not already, so that the application shows it."""
+        self.add_text_field(label_name)
+        column, placeholder, owner = self._owner()
         cursor = self._conn.execute(
-            """INSERT OR REPLACE INTO text_descriptions
-               (frame_id, label_name, content, modified_at)
-               VALUES (?, ?, ?, datetime('now'))""",
-            (frame_id, label_name, content),
+            f"""INSERT OR REPLACE INTO text_descriptions
+                (frame_id, label_name, content, modified_at{column})
+                VALUES (?, ?, ?, datetime('now'){placeholder})""",
+            (frame_id, label_name, content, *owner),
         )
         self._commit()
         return cursor.lastrowid
@@ -850,9 +1166,10 @@ class DidascalieProject:
         self, frame_id: int, label_name: str
     ) -> Optional[TextDescription]:
         """Get text description for a frame/label pair."""
+        mine, user = self._mine()
         row = self._conn.execute(
-            "SELECT * FROM text_descriptions WHERE frame_id = ? AND label_name = ?",
-            (frame_id, label_name),
+            f"SELECT * FROM text_descriptions WHERE frame_id = ? AND label_name = ?{mine}",
+            (frame_id, label_name, *user),
         ).fetchone()
 
         if row is None:
@@ -867,8 +1184,9 @@ class DidascalieProject:
 
     def get_text_descriptions_for_frame(self, frame_id: int) -> list[TextDescription]:
         """Get all text descriptions for a frame."""
+        mine, user = self._mine()
         rows = self._conn.execute(
-            "SELECT * FROM text_descriptions WHERE frame_id = ?", (frame_id,)
+            f"SELECT * FROM text_descriptions WHERE frame_id = ?{mine}", (frame_id, *user)
         ).fetchall()
 
         return [
@@ -1133,8 +1451,7 @@ class DidascalieProject:
             # Add classifications
             if classification:
                 for task_name, classes in classification.items():
-                    is_multilabel = len(classes) > 1
-                    self.add_classification(frame_id, task_name, classes, is_multilabel)
+                    self.add_classification(frame_id, task_name, classes)
 
             # Add text descriptions
             if text_descriptions:
@@ -1176,20 +1493,25 @@ class DidascalieProject:
 
         # Read before the workers start: they must not touch the connection.
         instance_labels = {l.name for l in self.get_labels() if l.is_instance}
+        # In an instance project the labels created along the way are instance
+        # labels too.
+        every_label = self.config.instance_segmentation_enabled
 
         def encode(item):
             image, masks = item if isinstance(item, tuple) else (item, None)
             return (
                 _encode_image(image, None, embed, format),
                 {
-                    k: _encode_mask(np.asarray(m), k in instance_labels)
+                    k: _encode_mask(np.asarray(m), every_label or k in instance_labels)
                     for k, m in (masks or {}).items()
                 },
             )
 
         frame_ids = []
         label_ids: dict[str, int] = {}
+        column, placeholder, owner = self._owner()
         with self.bulk(), ThreadPoolExecutor(max_workers=workers) as pool:
+            self._mark_rle8()
             sequence_id = self.get_or_create_sequence(name).id
             frame_index = self._conn.execute(
                 "SELECT COALESCE(MAX(frame_index), -1) + 1 FROM frames WHERE sequence_id = ?",
@@ -1219,10 +1541,10 @@ class DidascalieProject:
                         if label_name not in label_ids:
                             label_ids[label_name] = self.get_or_create_label(label_name).id
                         self._conn.execute(
-                            """INSERT OR REPLACE INTO annotations
-                               (frame_id, label_id, encoding, mask_data, modified_at)
-                               VALUES (?, ?, 'rle8', ?, datetime('now'))""",
-                            (frame_id, label_ids[label_name], mask_data),
+                            f"""INSERT OR REPLACE INTO annotations
+                                (frame_id, label_id, encoding, mask_data, modified_at{column})
+                                VALUES (?, ?, 'rle8', ?, datetime('now'){placeholder})""",
+                            (frame_id, label_ids[label_name], mask_data, *owner),
                         )
                     frame_ids.append(frame_id)
                     frame_index += 1
@@ -1247,19 +1569,23 @@ class DidascalieProject:
     # ==========================================
 
     def get_statistics(self) -> dict:
-        """Get project statistics."""
+        """Get project statistics (for the current user, where there are accounts)."""
+        mine, user = self._mine()
+        reviewed, reviewer = self._reviewed()
+
+        def count(table: str) -> int:
+            return self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE 1{mine}", user
+            ).fetchone()[0]
+
         return {
             "sequences": len(self.get_sequences()),
             "frames": self.get_frame_count(),
             "labels": len(self.get_labels()),
-            "annotations": self._conn.execute(
-                "SELECT COUNT(*) FROM annotations"
-            ).fetchone()[0],
-            "classifications": self._conn.execute(
-                "SELECT COUNT(*) FROM classifications"
-            ).fetchone()[0],
+            "annotations": count("annotations"),
+            "classifications": count("classifications"),
             "reviewed": self._conn.execute(
-                "SELECT COUNT(*) FROM frames WHERE reviewed = 1"
+                f"SELECT COUNT(*) FROM frames WHERE {reviewed}", reviewer
             ).fetchone()[0],
         }
 

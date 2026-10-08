@@ -8,7 +8,14 @@ import json
 
 @dataclass
 class ProjectConfig:
-    """Project configuration stored as JSON in the database."""
+    """
+    Project configuration stored as JSON in the database.
+
+    The application stores the definition of the labels, classification tasks
+    and text fields here too. Prefer the project methods (``add_label``,
+    ``add_classification_task``, ``set_multilabel_task``, ``add_text_field``)
+    to editing those four fields by hand.
+    """
 
     name: str = ""
     input_folder: Optional[str] = None
@@ -21,19 +28,44 @@ class ProjectConfig:
     input_regex: str = r"\.(png|jpe?g|bmp|tiff?|dcm)$"
     recursive: bool = True
     folders_as_sequences: bool = False
+    # ``[{"name", "color", "shades"}]``; None when the project never listed them.
+    segmentation_labels: Optional[list] = None
+    # ``[{"name", "classes", "default"}]``, one entry per multiclass task.
+    classification_tasks: Optional[list] = None
+    # ``{"name", "classes", "default"}``: the application has one multilabel task.
+    multilabel_task: Optional[dict] = None
+    text_fields: Optional[list] = None
+    # Keys this version does not know about, written back untouched so that
+    # saving the config never drops what a newer application stored.
+    extra: dict = field(default_factory=dict, repr=False)
 
     def to_json(self) -> str:
         """Serialize config to JSON string."""
-        return json.dumps(self.__dict__)
+        data = dict(self.extra)
+        data.update({k: v for k, v in self.__dict__.items() if k != "extra"})
+        if data["embed_threshold_kb"] is None:
+            data["embed_threshold_kb"] = 100
+        return json.dumps(data)
 
     @classmethod
     def from_json(cls, json_str: str) -> "ProjectConfig":
         """Deserialize config from JSON string."""
         data = json.loads(json_str)
-        # Handle any extra fields gracefully
-        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
-        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
-        return cls(**filtered_data)
+        known = {f for f in cls.__dataclass_fields__ if f != "extra"}
+        config = cls(**{k: v for k, v in data.items() if k in known})
+        config.extra = {k: v for k, v in data.items() if k not in known}
+        if config.embed_threshold_kb is None:
+            config.embed_threshold_kb = 100
+        return config
+
+
+@dataclass
+class User:
+    """An account of the project. Each user has their own annotations."""
+
+    id: int = 0
+    name: str = ""
+    role: str = "editor"
 
 
 @dataclass

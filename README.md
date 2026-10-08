@@ -61,6 +61,9 @@ with DidascalieProject.create("annotated.dida") as project:
 A label created with `is_instance=True` stores an instance id per pixel: 0 is
 background, and ids go from 1 to 255 within each frame.
 
+Instance segmentation is a setting of the whole project, as in the application:
+in an instance project, every label is an instance label.
+
 ```python
 import numpy as np
 from didascalie import DidascalieProject, Label, ProjectConfig
@@ -77,6 +80,53 @@ with DidascalieProject.create("nuclei.dida", config=config) as project:
     height, width = ids.shape
     ids = project.get_annotation(frame_id, label.id, width, height, raw=True)
 ```
+
+### Classification and Text
+
+Tasks are declared in the project, which is where the application looks for
+them. Adding a classification declares its task and classes if needed, so this is
+enough:
+
+```python
+project.add_classification(frame_id, "grade", ["mild"])              # multiclass
+project.add_classification(frame_id, "findings", ["drusen", "edema"])  # multilabel
+project.add_text_description(frame_id, "note", "Blurry at the edges")
+```
+
+To declare them up front, with classes no frame uses yet:
+
+```python
+project.add_classification_task("grade", ["none", "mild", "severe"])
+project.set_multilabel_task("findings", ["drusen", "edema", "haemorrhage"])
+project.add_text_field("note")
+```
+
+A project has any number of multiclass tasks (one class per frame) and one
+multilabel task.
+
+### Users
+
+Recent versions of the application give each annotator an account, with their
+own masks, classifications, texts and reviews. In such a project you read and
+write as one user: by default the first administrator, who owns everything
+annotated before accounts existed.
+
+```python
+with DidascalieProject("study.dida", user="Alice") as project:
+    print([u.name for u in project.get_users()])
+    masks = project.get_annotations_for_frame(frame_id)   # Alice's
+
+    project.set_user("Bob")
+    masks = project.get_annotations_for_frame(frame_id)   # Bob's
+
+    # Keep a model's predictions apart from the annotators' work
+    model = project.add_user("model")
+    project.set_user(model.id)
+    project.add_annotation(frame_id, label_id, prediction)
+```
+
+A project without accounts has no users (`project.get_users()` is empty) and
+works as before.
 
 ### Convert from COCO Format
 
@@ -138,7 +188,7 @@ deprecated alias for backwards compatibility with code written before the rebran
 #### Class Methods
 
 - `create(path, name, config, overwrite)` - Create a new project
-- `__init__(path)` - Open an existing project
+- `__init__(path, user)` - Open an existing project, as a given user if it has accounts
 
 #### Instance Methods
 
@@ -160,10 +210,22 @@ deprecated alias for backwards compatibility with code written before the rebran
 
 **Annotations:**
 - `add_annotation(frame_id, label_id, mask, encoding)` - Add annotation
-- `get_annotation(frame_id, label_id, width, height)` - Get annotation mask
+- `get_annotation(frame_id, label_id, width, height, raw)` - Get annotation mask
+- `get_annotations_for_frame(frame_id, raw)` - Get every label's mask on a frame
+- `set_frame_reviewed(frame_id, reviewed)` - Mark a frame reviewed
 
-**Classifications:**
+**Classifications and text:**
 - `add_classification(frame_id, task_name, selected_classes, is_multilabel)` - Add classification
+- `add_classification_task(name, classes, default)` - Declare a multiclass task
+- `set_multilabel_task(name, classes, default)` - Declare the multilabel task
+- `get_classification_tasks()` - Declared tasks and their classes
+- `add_text_description(frame_id, label_name, content)` - Add a text note
+- `add_text_field(name)` - Declare a text field
+
+**Users:**
+- `get_users()` - Accounts of the project
+- `set_user(user)` - Choose whose annotations are read and written
+- `add_user(name, role)` - Add an account
 
 **Bulk Operations:**
 - `import_folder(folder, pattern, recursive, folders_as_sequences, embed)` - Import folder
@@ -209,6 +271,17 @@ Didascalie uses SQLite for storage. The `.dida` file contains:
 - **frames** - Individual images (can be embedded or referenced)
 - **annotations** - Segmentation masks (RLE encoded)
 - **classifications** - Classification labels
+- **users** - Accounts, in projects saved by a version of the application that has them
+
+### Compatibility with the application
+
+This version reads and writes projects up to schema version 4 (user accounts).
+A project saved by a newer application is refused with a message asking you to
+upgrade this package.
+
+Projects created here use the version 3 layout. Every release of the application
+since 0.9 opens it, and the releases with user accounts upgrade it the first time
+they open it.
 
 Legacy `.labelmed` files can still be opened for backwards compatibility.
 

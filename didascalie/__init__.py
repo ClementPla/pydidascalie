@@ -29,6 +29,7 @@ Example usage:
 from .project import DidascalieProject, LabelMedProject
 from .models import (
     ProjectConfig,
+    User,
     Label,
     Sequence,
     Frame,
@@ -37,11 +38,12 @@ from .models import (
     TextDescription,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "DidascalieProject",
     "LabelMedProject",  # deprecated alias
     "ProjectConfig",
+    "User",
     "Label",
     "Sequence",
     "Frame",
