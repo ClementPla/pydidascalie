@@ -288,3 +288,37 @@ Legacy `.labelmed` files can still be opened for backwards compatibility.
 ## License
 
 MIT License
+
+## Serving Python functions to Didascalie
+
+`didascalie.com` lets the application call functions of yours over ZeroMQ
+(needs `pyzmq` and `msgpack`): keypoint proposals for registration, and
+segmentation of a frame or a whole sequence from the editor.
+
+```python
+from didascalie.com import register_kpts, register_seg, register_sequence_seg, serve
+
+@register_seg
+def vessels(image):                       # H x W x 3 uint8
+    """Segments the vessels."""
+    return {"vessel": model(image) > 0.5}  # {label: H x W}, C x H x W, or H x W
+
+@register_seg
+def refine(image, masks, active_label):   # extras are sent only when named
+    return sam(image, masks[active_label])  # H x W: added to the active label
+
+@register_sequence_seg
+def track(frames, masks, frame_index):    # T x H x W x 3, {label: T x H x W}
+    return {"cell": tracker(frames, masks["cell"][frame_index])}
+
+@register_kpts
+def match(reference, moving, existing):
+    return [((rx, ry), (mx, my)), ...]
+
+serve()  # blocks; 127.0.0.1:5556 is where Didascalie looks by default
+```
+
+Segmentation functions show up in the editor on their own while `serve()` is
+running. `register` is the former name of `register_kpts` and still works.
+See the [Didascalie documentation](https://didascalie.readthedocs.io/experimental/)
+for the full contract.
