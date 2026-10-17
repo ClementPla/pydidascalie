@@ -9,6 +9,7 @@ import json
 import io
 import os
 import uuid
+import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from .schema import (
     SCHEMA,
     SCHEMA_V4,
     SCHEMA_VERSION,
+    USER_ACCOUNTS_SCHEMA_VERSION,
     V3_PER_USER_TABLES,
 )
 from .models import (
@@ -30,9 +32,13 @@ from .models import (
     Label,
     Sequence,
     Frame,
+    FrameSource,
     Classification,
     TextDescription,
+    MICROSCOPY_EXTENSIONS,
+    VIDEO_EXTENSIONS,
 )
+from . import pixels
 from .encoding import (
     instance_mask,
     mask_to_png_bytes,
@@ -328,6 +334,14 @@ class DidascalieProject:
     # Users
     # ==========================================
 
+    def _has_table(self, table: str) -> bool:
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+            ).fetchone()
+            is not None
+        )
+
     def _has_column(self, table: str, column: str) -> bool:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         return any(row["name"] == column for row in rows)
@@ -430,7 +444,7 @@ class DidascalieProject:
             script.append(
                 "INSERT OR IGNORE INTO frame_reviews (frame_id, user_id)"
                 " SELECT id, 1 FROM frames WHERE reviewed = 1;"
-                f"PRAGMA user_version = {SCHEMA_VERSION};"
+                f"PRAGMA user_version = {USER_ACCOUNTS_SCHEMA_VERSION};"
                 "COMMIT;"
             )
             self._conn.commit()
@@ -860,19 +874,29 @@ class DidascalieProject:
         row = self._conn.execute("SELECT COUNT(*) FROM frames").fetchone()
         return row[0]
 
-    def get_frame_image(self, frame_id: int, input_folder: Optional[str] = None) -> Image.Image:
+    def get_frame_image(
+        self, frame_id: int, input_folder: Optional[str] = None, raw: bool = False
+    ) -> Union[Image.Image, np.ndarray]:
         """
         Get the image for a frame.
+
+        An 8-bit image comes back as stored. A frame deeper than 8 bits, or
+        with several channels (a microscopy frame: a multi-page TIFF, one page
+        per channel), comes back as the application shows it: 8-bit RGB through
+        its sequence's display settings, or the automatic ones when it has none
+        (see ``get_display_settings``).
 
         Args:
             frame_id: Frame ID
             input_folder: Base folder for non-embedded images
+            raw: Return the native values instead, a ``(height, width,
+                channels)`` array of uint8, uint16 or float32
 
         Returns:
-            PIL Image
+            PIL Image, or numpy array when ``raw``
         """
         row = self._conn.execute(
-            "SELECT embedded_data, relative_path FROM frames WHERE id = ?",
+            "SELECT sequence_id, embedded_data, relative_path FROM frames WHERE id = ?",
             (frame_id,),
         ).fetchone()
 
@@ -880,12 +904,85 @@ class DidascalieProject:
             raise ValueError(f"Frame not found: {frame_id}")
 
         if row["embedded_data"]:
-            return Image.open(io.BytesIO(row["embedded_data"]))
+            image = Image.open(io.BytesIO(row["embedded_data"]))
         elif row["relative_path"] and input_folder:
-            path = Path(input_folder) / row["relative_path"]
-            return Image.open(path)
+            image = Image.open(Path(input_folder) / row["relative_path"])
         else:
             raise ValueError("Frame has no embedded data and no input folder provided")
+
+        if raw:
+            return pixels.decode_raw(image)
+        if not pixels.needs_render(image):
+            return image
+        values = pixels.decode_raw(image)
+        display = self._stored_display_settings(row["sequence_id"])
+        return Image.fromarray(pixels.render_rgb(values, display), "RGB")
+
+    def _stored_display_settings(self, sequence_id: int) -> Optional[dict]:
+        if not self._has_table("sequence_display"):
+            return None
+        row = self._conn.execute(
+            "SELECT settings FROM sequence_display WHERE sequence_id = ?", (sequence_id,)
+        ).fetchone()
+        return json.loads(row["settings"]) if row else None
+
+    def get_display_settings(self, frame_id: int) -> dict:
+        """
+        The display settings a frame is shown with: per channel, a window,
+        colour and gamma, ``{"channels": [{"name", "visible", "color", "min",
+        "max", "gamma"}]}``. They are its sequence's, set in the application,
+        when they have one entry per channel of the frame; otherwise the
+        automatic ones (8-bit as stored, deeper data windowed at its 0.5 and
+        99.5 % percentiles).
+        """
+        sequence_id = self._conn.execute(
+            "SELECT sequence_id FROM frames WHERE id = ?", (frame_id,)
+        ).fetchone()
+        if sequence_id is None:
+            raise ValueError(f"Frame not found: {frame_id}")
+        values = self.get_frame_image(frame_id, raw=True)
+        display = self._stored_display_settings(sequence_id[0])
+        if display is None or len(display.get("channels") or []) != values.shape[-1]:
+            display = pixels.auto_display(values)
+        return display
+
+    def get_frame_source(self, frame_id: int) -> Optional[FrameSource]:
+        """
+        Where a frame converted from a microscopy file came from, or None for a
+        frame imported as an image.
+        """
+        sources = self._frame_sources("WHERE frame_id = ?", (frame_id,))
+        return sources[0] if sources else None
+
+    def get_frame_sources(self, sequence_id: Optional[int] = None) -> list[FrameSource]:
+        """The sources of the frames converted from microscopy files, of a sequence or all."""
+        if sequence_id is None:
+            return self._frame_sources("", ())
+        return self._frame_sources(
+            "WHERE frame_id IN (SELECT id FROM frames WHERE sequence_id = ?)", (sequence_id,)
+        )
+
+    def _frame_sources(self, where: str, args: tuple) -> list[FrameSource]:
+        if not self._has_table("frame_sources"):
+            return []
+        rows = self._conn.execute(
+            f"SELECT * FROM frame_sources {where} ORDER BY frame_id", args
+        ).fetchall()
+        return [
+            FrameSource(
+                frame_id=row["frame_id"],
+                source_path=row["source_path"],
+                series=row["series"],
+                level=row["level"],
+                t=row["t"],
+                z=row["z"],
+                channels=json.loads(row["channels"]),
+                physical_size_x=row["physical_size_x"],
+                physical_size_y=row["physical_size_y"],
+                physical_size_z=row["physical_size_z"],
+            )
+            for row in rows
+        ]
 
     def set_frame_reviewed(self, frame_id: int, reviewed: bool = True) -> None:
         """Mark a frame as reviewed (by the current user, where there are accounts)."""
@@ -1340,25 +1437,40 @@ class DidascalieProject:
         recursive: bool = True,
         folders_as_sequences: bool = False,
         embed: bool = True,
+        extensions: Optional[Iterable[str]] = None,
     ) -> dict:
         """
         Import images from a folder.
 
+        A file is taken when its extension is one of ``extensions`` and its
+        name matches ``pattern``, as in the application. Videos and microscopy
+        files are skipped: Python cannot decode them, so import them from the
+        application.
+
         Args:
             folder: Path to image folder
-            pattern: Regex pattern for filtering files
+            pattern: Regex filtering file names (default: the project's
+                ``input_regex``; empty matches any name)
             recursive: Search subfolders
             folders_as_sequences: Group subfolders as sequences
             embed: Embed images in database
+            extensions: Extensions to take, case-insensitive, with or without
+                the dot (default: the project's ``extensions``)
 
         Returns:
-            Dict with import statistics
+            Dict with import statistics; ``skipped`` lists the files left out
+            because Python cannot read them
         """
         folder = Path(folder)
-        pattern = pattern or self.config.input_regex
-        regex = re.compile(pattern, re.IGNORECASE)
+        if pattern is None:
+            pattern = self.config.input_regex
+        regex = re.compile(pattern or ".*", re.IGNORECASE)
+        if extensions is None:
+            extensions = self.config.extensions
+        allowed = {e.lower().lstrip(".") for e in extensions}
+        unreadable = set(VIDEO_EXTENSIONS) | set(MICROSCOPY_EXTENSIONS)
 
-        stats = {"sequences": 0, "frames": 0, "errors": []}
+        stats = {"sequences": 0, "frames": 0, "errors": [], "skipped": []}
 
         # Collect images
         images: dict[str, list[Path]] = {}  # sequence_name -> [paths]
@@ -1367,7 +1479,11 @@ class DidascalieProject:
         for path in folder.glob(glob_pattern):
             if not path.is_file():
                 continue
-            if not regex.search(path.name):
+            ext = path.suffix.lower().lstrip(".")
+            if ext not in allowed or not regex.search(path.name):
+                continue
+            if ext in unreadable:
+                stats["skipped"].append(str(path))
                 continue
 
             # Determine sequence name
@@ -1403,6 +1519,13 @@ class DidascalieProject:
                 except Exception as e:
                     stats["errors"].append(f"Sequence {seq_name}: {e}")
 
+        if stats["skipped"]:
+            warnings.warn(
+                f"Skipped {len(stats['skipped'])} video or microscopy file(s), "
+                "which pydidascalie cannot decode; import them from the "
+                f"Didascalie application (first: {stats['skipped'][0]})",
+                stacklevel=2,
+            )
         return stats
 
     def import_with_masks(

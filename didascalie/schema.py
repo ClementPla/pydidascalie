@@ -117,7 +117,16 @@ CREATE INDEX IF NOT EXISTS idx_keypoint_pairs_registration ON keypoint_pairs(reg
 #   3  masks stored as `rle8` (a value per pixel)
 #   4  user accounts: annotations, classifications, texts and reviews belong to
 #      a user, and "reviewed" moves from `frames.reviewed` to `frame_reviews`
-SCHEMA_VERSION = 4
+#   5  frames decoded from video files (`frames.video_id`, `videos`)
+#   6  `videos.seek_preroll`
+#   7  frames converted from microscopy files: multi-page TIFFs (one page per
+#      channel, 8, 16-bit or float), described by `frame_sources`, and shown
+#      with the per-sequence windows of `sequence_display`
+SCHEMA_VERSION = 7
+
+# The version `enable_user_accounts` brings a project to: it applies the
+# version 4 layout below, and the application adds what came after on open.
+USER_ACCOUNTS_SCHEMA_VERSION = 4
 
 # Version stamped into the files this package creates. They are written in the
 # version 3 layout above, which every release of the application since `rle8`

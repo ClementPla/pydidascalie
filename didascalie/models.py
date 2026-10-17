@@ -5,6 +5,16 @@ from typing import Optional
 from datetime import datetime
 import json
 
+# File extensions (lowercase, no dot) that a folder scan can take, as listed by
+# the application (IMAGE_EXTENSIONS, video::EXTENSIONS, MICROSCOPY_EXTENSIONS).
+# Python decodes images only; videos and microscopy files need the application.
+IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
+VIDEO_EXTENSIONS = ["mp4", "m4v", "mov", "mkv", "webm", "avi"]
+MICROSCOPY_EXTENSIONS = [
+    "czi", "lif", "nd2", "lsm", "oib", "oif", "ims", "vsi", "svs", "ndpi", "scn",
+    "bif", "dv", "r3d", "zvi", "dm3", "dm4", "stk",
+]
+
 
 @dataclass
 class ProjectConfig:
@@ -25,7 +35,10 @@ class ProjectConfig:
     classification_enabled: bool = False
     instance_segmentation_enabled: bool = False
     text_description_enabled: bool = False
-    input_regex: str = r"\.(png|jpe?g|bmp|tiff?|dcm)$"
+    # A folder scan takes a file when its extension is in ``extensions`` and its
+    # name matches ``input_regex`` (empty matches any name).
+    extensions: list = field(default_factory=lambda: list(IMAGE_EXTENSIONS))
+    input_regex: str = ".*"
     recursive: bool = True
     folders_as_sequences: bool = False
     # ``[{"name", "color", "shades"}]``; None when the project never listed them.
@@ -54,6 +67,9 @@ class ProjectConfig:
         known = {f for f in cls.__dataclass_fields__ if f != "extra"}
         config = cls(**{k: v for k, v in data.items() if k in known})
         config.extra = {k: v for k, v in data.items() if k not in known}
+        # Absent or null means every supported format: the images, for Python.
+        if config.extensions is None:
+            config.extensions = list(IMAGE_EXTENSIONS)
         if config.embed_threshold_kb is None:
             config.embed_threshold_kb = 100
         return config
@@ -107,6 +123,30 @@ class Frame:
     def is_embedded(self) -> bool:
         """Check if frame has embedded image data."""
         return self.embedded_data is not None
+
+
+@dataclass
+class FrameSource:
+    """
+    Where a frame converted from a microscopy file came from. The frame holds
+    the ``channels`` of time point ``t`` and slice ``z`` of that series.
+    """
+
+    frame_id: int = 0
+    # Relative to the image folder, or absolute.
+    source_path: str = ""
+    series: int = 0
+    # Resolution level, 0 being full resolution.
+    level: int = 0
+    t: int = 0
+    # None for a maximum projection over Z.
+    z: Optional[int] = None
+    # The file's channel indices the frame's pages hold, in page order.
+    channels: list[int] = field(default_factory=list)
+    # Pixel sizes in micrometres, when the file gives them.
+    physical_size_x: Optional[float] = None
+    physical_size_y: Optional[float] = None
+    physical_size_z: Optional[float] = None
 
 
 @dataclass
