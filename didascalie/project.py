@@ -25,6 +25,7 @@ from .schema import (
     SCHEMA_VERSION,
     USER_ACCOUNTS_SCHEMA_VERSION,
     V3_PER_USER_TABLES,
+    VECTOR_TABLE_V2,
 )
 from .models import (
     ProjectConfig,
@@ -39,6 +40,7 @@ from .models import (
     VIDEO_EXTENSIONS,
 )
 from . import pixels
+from .vector import VectorShape, rasterize as _rasterize_shapes
 from .encoding import (
     instance_mask,
     mask_to_png_bytes,
@@ -1139,6 +1141,135 @@ class DidascalieProject:
             (frame_id, label_id, *user),
         )
         self._commit()
+
+    # ==========================================
+    # Vector annotations
+    # ==========================================
+
+    def _vector_rows(self, frame_id: Optional[int], label_id: Optional[int]) -> list:
+        if not self._has_table("vector_annotations"):
+            return []
+        where, params = "1 = 1", []
+        if frame_id is not None:
+            where += " AND frame_id = ?"
+            params.append(frame_id)
+        if label_id is not None:
+            where += " AND label_id = ?"
+            params.append(label_id)
+        mine, user = self._mine()
+        return self._conn.execute(
+            f"SELECT frame_id, label_id, shapes FROM vector_annotations"
+            f" WHERE {where}{mine} ORDER BY frame_id, label_id",
+            (*params, *user),
+        ).fetchall()
+
+    @staticmethod
+    def _parse_shapes(row) -> list[VectorShape]:
+        shapes = [VectorShape.from_dict(d) for d in json.loads(row["shapes"])]
+        for s in shapes:
+            s.label_id = row["label_id"]  # the row is authoritative
+        return shapes
+
+    def get_vector_shapes(
+        self, frame_id: int, label_id: Optional[int] = None
+    ) -> list[VectorShape]:
+        """
+        The vector shapes of a frame, of one label or of all of them, for the
+        current user. Each shape's ``label_id`` tells its label.
+        """
+        return [
+            s for row in self._vector_rows(frame_id, label_id) for s in self._parse_shapes(row)
+        ]
+
+    def iter_vector_shapes(
+        self, label_id: Optional[int] = None
+    ) -> Iterator[tuple[int, list[VectorShape]]]:
+        """
+        ``(frame_id, shapes)`` for every frame that has vector shapes (of
+        ``label_id`` if given), for the current user, in frame id order.
+        """
+        frame_id, shapes = None, []
+        for row in self._vector_rows(None, label_id):
+            if row["frame_id"] != frame_id and shapes:
+                yield frame_id, shapes
+                shapes = []
+            frame_id = row["frame_id"]
+            shapes.extend(self._parse_shapes(row))
+        if shapes:
+            yield frame_id, shapes
+
+    def set_vector_shapes(
+        self, frame_id: int, label_id: int, shapes: Iterable[VectorShape]
+    ) -> None:
+        """
+        Replace the current user's vector shapes of one label on a frame.
+        An empty list deletes them, as the application does.
+        """
+        shapes = list(shapes)
+        if not shapes:
+            self.delete_vector_shapes(frame_id, label_id)
+            return
+        if not self._has_table("vector_annotations"):
+            # executescript would commit an open bulk() transaction
+            for statement in VECTOR_TABLE_V2.split(";"):
+                if statement.strip():
+                    self._conn.execute(statement)
+        data = []
+        for s in shapes:
+            s.label_id = label_id
+            data.append(s.to_dict())
+        column, placeholder, owner = self._owner()
+        self._conn.execute(
+            f"""INSERT INTO vector_annotations
+                (frame_id, label_id, shapes, modified_at{column})
+                VALUES (?, ?, ?, datetime('now'){placeholder})
+                ON CONFLICT(frame_id, label_id{column})
+                DO UPDATE SET shapes = excluded.shapes, modified_at = excluded.modified_at""",
+            (frame_id, label_id, json.dumps(data), *owner),
+        )
+        self._commit()
+
+    def add_vector_shape(
+        self, frame_id: int, shape: VectorShape, label_id: Optional[int] = None
+    ) -> None:
+        """Add a shape to those of its label on a frame (``label_id``, or the shape's own)."""
+        label_id = shape.label_id if label_id is None else label_id
+        if label_id is None:
+            raise ValueError("the shape has no label: pass label_id")
+        self.set_vector_shapes(
+            frame_id, label_id, self.get_vector_shapes(frame_id, label_id) + [shape]
+        )
+
+    def delete_vector_shapes(self, frame_id: int, label_id: Optional[int] = None) -> None:
+        """Delete the current user's vector shapes on a frame, of one label or all."""
+        if not self._has_table("vector_annotations"):
+            return
+        mine, user = self._mine()
+        label = " AND label_id = ?" if label_id is not None else ""
+        params = (label_id,) if label_id is not None else ()
+        self._conn.execute(
+            f"DELETE FROM vector_annotations WHERE frame_id = ?{label}{mine}",
+            (frame_id, *params, *user),
+        )
+        self._commit()
+
+    def get_vector_mask(
+        self, frame_id: int, label_id: int, fill: Optional[bool] = None
+    ) -> Optional[np.ndarray]:
+        """
+        The vector shapes of one label on a frame, rasterized at the frame's
+        size: a ``(height, width)`` uint8 mask, 0 or 255, or None without shapes.
+
+        Args:
+            fill: None rasterizes as the application does (closed and filled
+                shapes are filled, others stroked); True fills every closed
+                shape; False strokes them all.
+        """
+        shapes = self.get_vector_shapes(frame_id, label_id)
+        if not shapes:
+            return None
+        frame = self.get_frame(frame_id)
+        return _rasterize_shapes(shapes, frame.width, frame.height, fill=fill)
 
     # ==========================================
     # Classifications

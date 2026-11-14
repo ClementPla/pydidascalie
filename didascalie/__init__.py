@@ -38,6 +38,7 @@ from .models import (
     Classification,
     TextDescription,
 )
+from .vector import VectorNode, VectorShape, rasterize
 
 __version__ = "0.2.0"
 __all__ = [
@@ -52,4 +53,7 @@ __all__ = [
     "Annotation",
     "Classification",
     "TextDescription",
+    "VectorNode",
+    "VectorShape",
+    "rasterize",
 ]

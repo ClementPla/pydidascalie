@@ -128,6 +128,39 @@ with DidascalieProject("study.dida", user="Alice") as project:
 A project without accounts has no users (`project.get_users()` is empty) and
 works as before.
 
+### Vector Annotations
+
+Shapes drawn with the editor's vector tools (paths, polygons, ellipses) are
+`VectorShape`s: a list of `VectorNode`s, each a point with two Bézier handles,
+in image pixels. They belong to a label and, like masks, to the current user.
+
+```python
+from didascalie import DidascalieProject, VectorShape, rasterize
+
+with DidascalieProject("study.dida") as project:
+    bg = project.get_label_by_name("Background")
+
+    # Read
+    for frame_id, shapes in project.iter_vector_shapes(bg.id):
+        frame = project.get_frame(frame_id)
+        inside = rasterize(shapes, frame.width, frame.height, fill=True)  # 0 / 255
+
+    shapes = project.get_vector_shapes(frame_id)        # every label
+    mask = project.get_vector_mask(frame_id, bg.id)     # rasterized at the frame size
+
+    # Write
+    project.add_vector_shape(frame_id, VectorShape.ellipse(400, 300, 120), bg.id)
+    project.set_vector_shapes(frame_id, bg.id, [
+        VectorShape.from_points([(10, 10), (200, 10), (200, 150)]),
+    ])
+    project.delete_vector_shapes(frame_id, bg.id)
+```
+
+Rasterization matches the application's export: a shape that is closed and
+`filled` is filled (a pixel is set when its centre is inside, even-odd), any
+other is drawn as a 3 px stroke. `fill=True` fills every closed shape whatever
+its `filled` flag; `fill=False` strokes them all.
+
 ### Convert from COCO Format
 
 ```python
@@ -213,6 +246,14 @@ deprecated alias for backwards compatibility with code written before the rebran
 - `get_annotation(frame_id, label_id, width, height, raw)` - Get annotation mask
 - `get_annotations_for_frame(frame_id, raw)` - Get every label's mask on a frame
 - `set_frame_reviewed(frame_id, reviewed)` - Mark a frame reviewed
+
+**Vector annotations:**
+- `get_vector_shapes(frame_id, label_id)` - Shapes of a frame (of one label, or all)
+- `iter_vector_shapes(label_id)` - `(frame_id, shapes)` for every frame with shapes
+- `set_vector_shapes(frame_id, label_id, shapes)` - Replace a label's shapes (empty deletes)
+- `add_vector_shape(frame_id, shape, label_id)` - Add one shape
+- `delete_vector_shapes(frame_id, label_id)` - Delete shapes (of one label, or all)
+- `get_vector_mask(frame_id, label_id, fill)` - A label's shapes rasterized
 
 **Classifications and text:**
 - `add_classification(frame_id, task_name, selected_classes, is_multilabel)` - Add classification

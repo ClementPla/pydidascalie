@@ -110,6 +110,21 @@ CREATE INDEX IF NOT EXISTS idx_registrations_ref_frame ON registrations(referenc
 CREATE INDEX IF NOT EXISTS idx_keypoint_pairs_registration ON keypoint_pairs(registration_id);
 """
 
+# The vector annotations table as schema version 2 adds it (the application's
+# `MIGRATION_V2`), for a project without accounts that does not have it yet.
+VECTOR_TABLE_V2 = """
+CREATE TABLE IF NOT EXISTS vector_annotations (
+    id INTEGER PRIMARY KEY,
+    frame_id INTEGER NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
+    label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    shapes JSON NOT NULL,
+    modified_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(frame_id, label_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vector_annotations_frame
+    ON vector_annotations(frame_id);
+"""
+
 # Newest schema version of the application this package reads and writes.
 #
 #   1  baseline
