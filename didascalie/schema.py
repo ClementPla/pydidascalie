@@ -137,7 +137,9 @@ CREATE INDEX IF NOT EXISTS idx_vector_annotations_frame
 #   7  frames converted from microscopy files: multi-page TIFFs (one page per
 #      channel, 8, 16-bit or float), described by `frame_sources`, and shown
 #      with the per-sequence windows of `sequence_display`
-SCHEMA_VERSION = 7
+#   8  regression values (`regressions`), declared in the config's
+#      `regression_tasks`
+SCHEMA_VERSION = 8
 
 # The version `enable_user_accounts` brings a project to: it applies the
 # version 4 layout below, and the application adds what came after on open.
@@ -340,9 +342,43 @@ CREATE TABLE IF NOT EXISTS ml_models (
 """
 
 # The tables that became per-user in version 4, with the columns they had before.
+# `regressions` came later, but a project created here holds it in the version
+# 3 layout too (see `REGRESSIONS_TABLE_V3`).
 V3_PER_USER_TABLES = {
     "annotations": "id, frame_id, label_id, encoding, mask_data, modified_at",
     "vector_annotations": "id, frame_id, label_id, shapes, modified_at",
     "classifications": "id, frame_id, task_name, selected_classes, is_multilabel, modified_at",
     "text_descriptions": "id, frame_id, label_name, content, modified_at",
+    "regressions": "id, frame_id, task_name, value, modified_at",
 }
+
+# Regression values (per frame, per task, per user), as the application has
+# them since schema version 8. Added to a project with user accounts the first
+# time a regression value is declared or stored in it.
+REGRESSIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS regressions (
+    id INTEGER PRIMARY KEY,
+    frame_id INTEGER NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL DEFAULT 1 REFERENCES users(id) ON DELETE CASCADE,
+    task_name TEXT NOT NULL,
+    value REAL NOT NULL,
+    modified_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(frame_id, task_name, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_regressions_frame ON regressions(frame_id);
+"""
+
+# The same table for a project without accounts (the version 3 layout this
+# package creates). The application gives its rows to the first account when
+# it upgrades the project, as it does for masks and classifications.
+REGRESSIONS_TABLE_V3 = """
+CREATE TABLE IF NOT EXISTS regressions (
+    id INTEGER PRIMARY KEY,
+    frame_id INTEGER NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
+    task_name TEXT NOT NULL,
+    value REAL NOT NULL,
+    modified_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(frame_id, task_name)
+);
+CREATE INDEX IF NOT EXISTS idx_regressions_frame ON regressions(frame_id);
+"""

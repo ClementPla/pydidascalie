@@ -36,11 +36,12 @@ from .models import (
     FrameSource,
     Annotation,
     Classification,
+    Regression,
     TextDescription,
 )
 from .vector import VectorNode, VectorShape, rasterize
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "DidascalieProject",
     "LabelMedProject",  # deprecated alias
@@ -52,6 +53,7 @@ __all__ = [
     "FrameSource",
     "Annotation",
     "Classification",
+    "Regression",
     "TextDescription",
     "VectorNode",
     "VectorShape",

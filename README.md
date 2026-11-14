@@ -104,6 +104,41 @@ project.add_text_field("note")
 A project has any number of multiclass tasks (one class per frame) and one
 multilabel task.
 
+### Regression
+
+A regression value is a number given to a frame: an age, a diameter, a score.
+A project declares any number of them, each with a type and an optional range:
+
+```python
+from didascalie import DidascalieProject, ProjectConfig
+
+project = DidascalieProject.create(
+    "galaxies.dida",
+    config=ProjectConfig(name="Galaxies", segmentation_enabled=False),
+)
+project.add_regression_task("smooth", min=0, max=1)          # float32 by default
+project.add_regression_task("edge_on", dtype="float64", min=0, max=1)
+project.add_regression_task("arm_count", dtype="int32", min=0)
+
+frame_id = project.import_with_masks(
+    "galaxy.png",
+    masks={},
+    regression={"smooth": 0.82, "edge_on": 0.05, "arm_count": 2},
+)
+project.add_regression(frame_id, "smooth", 0.9)              # replaces 0.82
+project.get_regressions_for_frame(frame_id)                  # {"smooth": 0.9, ...}
+```
+
+- `dtype` is `float32`, `float64` or `int32`. A value is rounded to it when it
+  is stored, and `add_regression` returns what was stored.
+- `min` and `max` are each optional. A value outside the range raises
+  `ValueError`. With both bounds, the application sets the value with a slider.
+- Storing a value for a name that is not declared declares it, as a `float32`
+  without a range.
+
+Regression needs a version of the application that has it (schema version 8):
+older ones open the project but do not show the values.
+
 ### Users
 
 Recent versions of the application give each annotator an account, with their
@@ -263,6 +298,14 @@ deprecated alias for backwards compatibility with code written before the rebran
 - `add_text_description(frame_id, label_name, content)` - Add a text note
 - `add_text_field(name)` - Declare a text field
 
+**Regression:**
+- `add_regression_task(name, dtype, min, max)` - Declare a regression value
+- `get_regression_tasks()` - Declared regression values, with type and range
+- `add_regression(frame_id, task_name, value)` - Give a frame its value
+- `get_regression(frame_id, task_name)` - A frame's value, or None
+- `get_regressions_for_frame(frame_id)` - A frame's values by task name
+- `delete_regression(frame_id, task_name)` - Remove a frame's value
+
 **Users:**
 - `get_users()` - Accounts of the project
 - `set_user(user)` - Choose whose annotations are read and written
@@ -270,7 +313,7 @@ deprecated alias for backwards compatibility with code written before the rebran
 
 **Bulk Operations:**
 - `import_folder(folder, pattern, recursive, folders_as_sequences, embed)` - Import folder
-- `import_with_masks(image, masks, sequence_name, classification)` - Import with masks
+- `import_with_masks(image, masks, sequence_name, classification, text_descriptions, embed, regression)` - Import with masks
 - `iter_frames()` - Iterate over all frames
 
 ### Data Models
@@ -312,11 +355,12 @@ Didascalie uses SQLite for storage. The `.dida` file contains:
 - **frames** - Individual images (can be embedded or referenced)
 - **annotations** - Segmentation masks (RLE encoded)
 - **classifications** - Classification labels
+- **regressions** - Regression values, in projects that declare some
 - **users** - Accounts, in projects saved by a version of the application that has them
 
 ### Compatibility with the application
 
-This version reads and writes projects up to schema version 4 (user accounts).
+This version reads and writes projects up to schema version 8 (regression values).
 A project saved by a newer application is refused with a message asking you to
 upgrade this package.
 

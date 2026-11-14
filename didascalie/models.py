@@ -15,16 +15,20 @@ MICROSCOPY_EXTENSIONS = [
     "bif", "dv", "r3d", "zvi", "dm3", "dm4", "stk",
 ]
 
+# Number types of a regression value. Every value is stored as a 64-bit float;
+# the type decides how it is rounded first, and the dtype it is exported with.
+REGRESSION_TYPES = ("float32", "float64", "int32")
+
 
 @dataclass
 class ProjectConfig:
     """
     Project configuration stored as JSON in the database.
 
-    The application stores the definition of the labels, classification tasks
-    and text fields here too. Prefer the project methods (``add_label``,
-    ``add_classification_task``, ``set_multilabel_task``, ``add_text_field``)
-    to editing those four fields by hand.
+    The application stores the definition of the labels, classification tasks,
+    text fields and regression values here too. Prefer the project methods
+    (``add_label``, ``add_classification_task``, ``set_multilabel_task``,
+    ``add_text_field``, ``add_regression_task``) to editing those fields by hand.
     """
 
     name: str = ""
@@ -35,6 +39,7 @@ class ProjectConfig:
     classification_enabled: bool = False
     instance_segmentation_enabled: bool = False
     text_description_enabled: bool = False
+    regression_enabled: bool = False
     # A folder scan takes a file when its extension is in ``extensions`` and its
     # name matches ``input_regex`` (empty matches any name).
     extensions: list = field(default_factory=lambda: list(IMAGE_EXTENSIONS))
@@ -48,6 +53,9 @@ class ProjectConfig:
     # ``{"name", "classes", "default"}``: the application has one multilabel task.
     multilabel_task: Optional[dict] = None
     text_fields: Optional[list] = None
+    # ``[{"name", "dtype", "min", "max"}]``, one entry per regression value.
+    # ``dtype`` is one of ``REGRESSION_TYPES``; a bound is a number or None.
+    regression_tasks: Optional[list] = None
     # Keys this version does not know about, written back untouched so that
     # saving the config never drops what a newer application stored.
     extra: dict = field(default_factory=dict, repr=False)
@@ -180,6 +188,17 @@ class Classification:
     def from_json(cls, json_str: str) -> list[str]:
         """Deserialize selected classes from JSON."""
         return json.loads(json_str)
+
+
+@dataclass
+class Regression:
+    """A number given to a frame for one regression task."""
+
+    id: Optional[int] = None
+    frame_id: int = 0
+    task_name: str = ""
+    value: float = 0.0
+    modified_at: datetime = field(default_factory=datetime.now)
 
 
 @dataclass

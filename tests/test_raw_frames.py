@@ -107,18 +107,17 @@ def two_channels() -> np.ndarray:
     return np.stack([a, b])
 
 
-def test_schema_7_opens_and_8_is_refused(tmp_path, v7_path):
-    assert SCHEMA_VERSION == 7
+def test_schema_7_opens_and_a_newer_one_is_refused(tmp_path, v7_path):
     with DidascalieProject(v7_path) as project:
         assert project.schema_version == 7
 
-    newer = tmp_path / "v8.dida"
+    newer = tmp_path / "newer.dida"
     DidascalieProject.create(newer).close()
     conn = sqlite3.connect(str(newer))
-    conn.execute("PRAGMA user_version = 8")
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
     conn.commit()
     conn.close()
-    with pytest.raises(ValueError, match="schema version 8"):
+    with pytest.raises(ValueError, match=f"schema version {SCHEMA_VERSION + 1}"):
         DidascalieProject(newer)
 
 

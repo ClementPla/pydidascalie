@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional, Union, Iterator
 import json
 import io
+import math
 import os
 import uuid
 import warnings
@@ -20,6 +21,8 @@ from PIL import Image
 
 from .schema import (
     CREATE_SCHEMA_VERSION,
+    REGRESSIONS_TABLE,
+    REGRESSIONS_TABLE_V3,
     SCHEMA,
     SCHEMA_V4,
     SCHEMA_VERSION,
@@ -37,6 +40,7 @@ from .models import (
     Classification,
     TextDescription,
     MICROSCOPY_EXTENSIONS,
+    REGRESSION_TYPES,
     VIDEO_EXTENSIONS,
 )
 from . import pixels
@@ -433,7 +437,9 @@ class DidascalieProject:
             script = ["BEGIN;"]
             script += [f"ALTER TABLE {t} RENAME TO {t}_v3;" for t in old]
             # The tables just moved aside, in their current shape, and account 1.
-            script.append(SCHEMA_V4)
+            # `regressions` is newer than version 4, so it comes separately.
+            current = SCHEMA_V4 + (REGRESSIONS_TABLE if "regressions" in old else "")
+            script.append(current)
             for table in old:
                 columns = V3_PER_USER_TABLES[table]
                 script.append(
@@ -442,7 +448,7 @@ class DidascalieProject:
                     f"DROP TABLE {table}_v3;"
                 )
             # Once more for the indexes, which went with the dropped tables.
-            script.append(SCHEMA_V4)
+            script.append(current)
             script.append(
                 "INSERT OR IGNORE INTO frame_reviews (frame_id, user_id)"
                 " SELECT id, 1 FROM frames WHERE reviewed = 1;"
@@ -564,6 +570,64 @@ class DidascalieProject:
             config.text_fields = [*(config.text_fields or []), name]
             config.text_description_enabled = True
             self.update_config(config)
+
+    def add_regression_task(
+        self,
+        name: str,
+        dtype: str = "float32",
+        min: Optional[float] = None,
+        max: Optional[float] = None,
+    ) -> None:
+        """
+        Declare a regression value: a number each frame can be given, shown by
+        the application on every frame. Declaring a name again replaces its
+        type and range; the values already stored are kept.
+
+        Args:
+            name: Name of the value, unique among the regression values
+            dtype: 'float32' (default), 'float64' or 'int32'. A value is rounded
+                to this type when it is stored.
+            min: Smallest value accepted, or None for no lower bound
+            max: Largest value accepted, or None for no upper bound. With both
+                bounds, the application sets the value with a slider.
+        """
+        if dtype not in REGRESSION_TYPES:
+            raise ValueError(f"dtype must be one of {REGRESSION_TYPES}, not {dtype!r}")
+        for bound in (min, max):
+            if bound is not None and not math.isfinite(bound):
+                raise ValueError("A range bound must be a finite number")
+        if min is not None and max is not None and min >= max:
+            raise ValueError(f"The minimum ({min}) must be below the maximum ({max})")
+
+        task = {
+            "name": name,
+            "dtype": dtype,
+            "min": None if min is None else float(min),
+            "max": None if max is None else float(max),
+        }
+        config = self.config
+        tasks = list(config.regression_tasks or [])
+        for i, existing in enumerate(tasks):
+            if existing["name"] == name:
+                tasks[i] = task
+                break
+        else:
+            tasks.append(task)
+        config.regression_tasks = tasks
+        config.regression_enabled = True
+        self._ensure_regression_table()
+        self.update_config(config)
+
+    def get_regression_tasks(self) -> dict[str, dict]:
+        """Declared regression values: ``{name: {"dtype", "min", "max"}}``."""
+        return {
+            t["name"]: {
+                "dtype": t.get("dtype") or "float32",
+                "min": t.get("min"),
+                "max": t.get("max"),
+            }
+            for t in self.config.regression_tasks or []
+        }
 
     def _sync_label_config(self) -> None:
         """
@@ -1428,6 +1492,106 @@ class DidascalieProject:
         ]
 
     # ==========================================
+    # Regressions (numbers given to a frame)
+    # ==========================================
+
+    def _ensure_regression_table(self) -> None:
+        """Add the ``regressions`` table to a project that lacks it, in the
+        layout of the project: with or without user accounts."""
+        if self._has_table("regressions"):
+            return
+        table = REGRESSIONS_TABLE if self._user_scoped else REGRESSIONS_TABLE_V3
+        for statement in table.split(";"):
+            if statement.strip():
+                self._conn.execute(statement)
+
+    @staticmethod
+    def _conform_regression(name: str, task: dict, value: float) -> float:
+        """The value to store: within the task's range, in the task's type.
+        The range is checked on the value as given, before rounding, as the
+        application does."""
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError(f"{name!r} needs a finite number")
+        low, high = task["min"], task["max"]
+        if (low is not None and value < low) or (high is not None and value > high):
+            if low is not None and high is not None:
+                wanted = f"between {low} and {high}"
+            elif low is not None:
+                wanted = f"at least {low}"
+            else:
+                wanted = f"at most {high}"
+            raise ValueError(f"{name!r} must be {wanted} (got {value})")
+
+        dtype = task["dtype"]
+        if dtype == "float32":
+            with np.errstate(over="ignore"):
+                stored = float(np.float32(value))
+        elif dtype == "int32":
+            # Half away from zero, like the application (not Python's round()).
+            stored = math.copysign(math.floor(abs(value) + 0.5), value)
+            if not -(2**31) <= stored <= 2**31 - 1:
+                stored = math.inf
+        else:
+            stored = value
+        if not math.isfinite(stored):
+            raise ValueError(f"{value} does not fit in {dtype} ({name!r})")
+        return stored
+
+    def add_regression(self, frame_id: int, task_name: str, value: float) -> float:
+        """
+        Give a frame its value for a regression task, replacing the previous
+        one. A task that is not declared yet is declared as a ``float32``
+        without a range; use ``add_regression_task`` first to choose both.
+
+        Returns:
+            The value as stored: rounded to the type of the task.
+        """
+        task = self.get_regression_tasks().get(task_name)
+        if task is None:
+            self.add_regression_task(task_name)
+            task = self.get_regression_tasks()[task_name]
+        stored = self._conform_regression(task_name, task, value)
+
+        self._ensure_regression_table()
+        column, placeholder, owner = self._owner()
+        self._conn.execute(
+            f"""INSERT OR REPLACE INTO regressions
+                (frame_id, task_name, value, modified_at{column})
+                VALUES (?, ?, ?, datetime('now'){placeholder})""",
+            (frame_id, task_name, stored, *owner),
+        )
+        self._commit()
+        return stored
+
+    def get_regression(self, frame_id: int, task_name: str) -> Optional[float]:
+        """A frame's value for a regression task, or None when it has none."""
+        return self.get_regressions_for_frame(frame_id).get(task_name)
+
+    def get_regressions_for_frame(self, frame_id: int) -> dict[str, float]:
+        """A frame's regression values by task name. A task without a value
+        is absent."""
+        if not self._has_table("regressions"):
+            return {}
+        mine, user = self._mine()
+        rows = self._conn.execute(
+            f"SELECT task_name, value FROM regressions WHERE frame_id = ?{mine}",
+            (frame_id, *user),
+        ).fetchall()
+        return {row["task_name"]: row["value"] for row in rows}
+
+    def delete_regression(self, frame_id: int, task_name: str) -> None:
+        """Remove a frame's value for a regression task."""
+        if not self._has_table("regressions"):
+            return
+        mine, user = self._mine()
+        self._conn.execute(
+            f"DELETE FROM regressions WHERE frame_id = ? AND task_name = ?{mine}",
+            (frame_id, task_name, *user),
+        )
+        self._commit()
+
+    # ==========================================
     # Registrations (keypoint pairs between two frames)
     # ==========================================
 
@@ -1667,6 +1831,7 @@ class DidascalieProject:
         classification: Optional[dict[str, list[str]]] = None,
         text_descriptions: Optional[dict[str, str]] = None,
         embed: bool = True,
+        regression: Optional[dict[str, float]] = None,
     ) -> int:
         """
         Import an image with pre-existing masks.
@@ -1678,6 +1843,7 @@ class DidascalieProject:
             classification: Optional dict mapping task_name -> selected_classes
             text_descriptions: Optional dict mapping label_name -> text
             embed: Embed image in database
+            regression: Optional dict mapping regression task name -> value
 
         Returns:
             Frame ID
@@ -1711,6 +1877,11 @@ class DidascalieProject:
             if text_descriptions:
                 for label_name, text in text_descriptions.items():
                     self.add_text_description(frame_id, label_name, text)
+
+            # Add regression values
+            if regression:
+                for task_name, value in regression.items():
+                    self.add_regression(frame_id, task_name, value)
 
         return frame_id
 
@@ -1838,6 +2009,7 @@ class DidascalieProject:
             "labels": len(self.get_labels()),
             "annotations": count("annotations"),
             "classifications": count("classifications"),
+            "regressions": count("regressions") if self._has_table("regressions") else 0,
             "reviewed": self._conn.execute(
                 f"SELECT COUNT(*) FROM frames WHERE {reviewed}", reviewer
             ).fetchone()[0],
