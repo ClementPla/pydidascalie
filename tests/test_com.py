@@ -4,6 +4,10 @@ import numpy as np
 import pytest
 
 from didascalie.com import (
+    Boolean,
+    Enum,
+    Float,
+    Int,
     decorators,
     register_kpts,
     register_seg,
@@ -77,7 +81,7 @@ def test_ping_describes_every_kind():
     by_name = {f["name"]: f for f in reply["functions"]}
     assert by_name["match"]["kind"] == "keypoints"
     assert by_name["unet"] == {"name": "unet", "kind": "seg", "doc": "Segments vessels.",
-                               "wants": ["masks", "active_label"]}
+                               "wants": ["masks", "active_label"], "params": []}
     assert by_name["track"]["kind"] == "sequence_seg"
 
 
@@ -216,3 +220,110 @@ def test_sequence_per_label_stack_and_length_check():
 
     run, _ = run_sequence("short")
     assert not run["ok"] and "2 frames" in run["error"]
+
+
+def test_arguments_are_described_in_ping():
+    @register_seg("unet", threshold=Float(0.5, min=0, max=1, step=0.05, label="Cut-off"),
+                  iterations=Int(3, min=1), clean=Boolean(True, hint="Removes specks"),
+                  mode=Enum(["fast", "accurate"], default="accurate"))
+    def f(image, masks, threshold, iterations, clean, mode):
+        pass
+
+    (fn,) = call({"op": "ping"})["functions"]
+    assert fn["wants"] == ["masks"]
+    assert fn["params"] == [
+        {"name": "threshold", "type": "float", "label": "Cut-off", "default": 0.5,
+         "hint": "Number from 0 to 1", "min": 0.0, "max": 1.0, "step": 0.05},
+        {"name": "iterations", "type": "int", "label": "Iterations", "default": 3,
+         "hint": "Integer, at least 1", "min": 1.0},
+        {"name": "clean", "type": "bool", "label": "Clean", "default": True,
+         "hint": "Removes specks"},
+        {"name": "mode", "type": "enum", "label": "Mode", "default": "accurate", "hint": "",
+         "choices": ["fast", "accurate"]},
+    ]
+
+
+def test_arguments_reach_the_function_with_defaults():
+    seen = {}
+
+    @register_seg(threshold=Float(0.5), n=Int(2), flag=Boolean(), mode=Enum(["a", "b"]))
+    def f(image, active_label, threshold, n, flag, mode):
+        seen.update(active=active_label, threshold=threshold, n=n, flag=flag, mode=mode)
+
+    assert segment("f", args={"threshold": 1, "n": 4.0, "mode": "b"})["ok"]
+    assert seen == {"active": "disc", "threshold": 1.0, "n": 4, "flag": False, "mode": "b"}
+    assert isinstance(seen["threshold"], float) and isinstance(seen["n"], int)
+
+    # An older Didascalie sends no arguments.
+    assert segment("f")["ok"]
+    assert (seen["threshold"], seen["n"], seen["mode"]) == (0.5, 2, "a")
+
+
+@pytest.mark.parametrize("args, match", [
+    ({"t": 2.0}, "t: 2.0 is above"),
+    ({"n": 1.5}, "n: expected an integer"),
+    ({"n": True}, "n: expected an integer"),
+    ({"b": 1}, "b: expected true or false"),
+    ({"e": "z"}, "e: 'z' is not one of"),
+    ({"other": 1}, "Unknown arguments: other"),
+])
+def test_bad_arguments_are_refused(args, match):
+    called = []
+
+    @register_seg(t=Float(0.5, max=1), n=Int(1), b=Boolean(), e=Enum(["x"]))
+    def f(image, t, n, b, e):
+        called.append(1)
+
+    reply = segment("f", args=args)
+    assert not reply["ok"] and match in reply["error"] and not called
+
+
+def test_sequence_arguments_are_checked_at_begin():
+    seen = {}
+
+    @register_sequence_seg("track", radius=Int(1, min=0))
+    def track(frames, radius):
+        seen["radius"] = radius
+
+    begin = {"op": "seq_begin", "name": "track", "n_frames": 1, "labels": LABELS,
+             "active_label": None, "frame_index": 0}
+    assert not call({**begin, "args": {"radius": -1}})["ok"]
+    assert call({**begin, "args": {"radius": 5}})["ok"]
+    assert call({"op": "seq_frame", "index": 0,
+                 "image": payload(np.zeros((H, W, 3), np.uint8))})["ok"]
+    assert call({"op": "seq_run"})["ok"] and seen["radius"] == 5
+
+
+def test_a_parameter_can_be_called_name():
+    @register_seg("f", name=Enum(["x"]))
+    def f(image, name):
+        return None
+
+    assert segment("f")["ok"]
+
+
+@pytest.mark.parametrize("declared, match", [
+    ({"missing": Int(1)}, "not a parameter"),
+    ({"masks": Int(1)}, "reserved"),
+    ({"image": Int(1)}, "image parameter"),
+    ({"x": 3}, "must be an Int"),
+])
+def test_bad_declarations_fail_at_decoration(declared, match):
+    with pytest.raises(TypeError, match=match):
+        @register_seg("f", **declared)
+        def f(image, masks, x=0):
+            pass
+
+
+@pytest.mark.parametrize("build", [
+    lambda: Float(2, max=1),
+    lambda: Int(1.5),
+    lambda: Int(1, min=3, max=2),
+    lambda: Float(1, step=0),
+    lambda: Enum([]),
+    lambda: Enum(["a"], default="b"),
+    lambda: Boolean(1),
+])
+def test_bad_types_fail_when_built(build):
+    with pytest.raises(ValueError):
+        build()

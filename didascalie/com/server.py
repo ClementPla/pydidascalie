@@ -3,7 +3,7 @@ import numpy as np
 import zmq
 import msgpack
 
-from . import decorators, masks
+from . import decorators, masks, params
 
 # 2: segmentation ops, and `functions` in the ping reply.
 PROTOCOL_VERSION = 2
@@ -35,7 +35,8 @@ def _extras(entry, msg: dict, current_masks) -> dict:
         "active_label": msg.get("active_label"),
         "frame_index": msg.get("frame_index"),
     }
-    return {k: (v() if callable(v) else v) for k, v in available.items() if k in entry.wants}
+    extras = {k: (v() if callable(v) else v) for k, v in available.items() if k in entry.wants}
+    return {**extras, **params.resolve(entry.params, msg.get("args"))}
 
 
 def _segment(msg: dict) -> dict:
@@ -60,8 +61,11 @@ def _segment(msg: dict) -> dict:
 
 def _seq_begin(msg: dict) -> dict:
     name = msg["name"]
-    if decorators._get(name, decorators.SEQUENCE_SEG) is None:
+    entry = decorators._get(name, decorators.SEQUENCE_SEG)
+    if entry is None:
         return _missing(name, decorators.SEQUENCE_SEG)
+    # Refuse bad arguments before any frame is sent.
+    params.resolve(entry.params, msg.get("args"))
     _SESSION.clear()
     _SESSION.update(msg=msg, frames=[None] * msg["n_frames"],
                     masks=[None] * msg["n_frames"], layers=None, shapes=None)

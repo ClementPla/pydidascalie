@@ -34,7 +34,6 @@ class ProjectConfig:
     name: str = ""
     input_folder: Optional[str] = None
     images_embedded: bool = False
-    embed_threshold_kb: int = 100
     segmentation_enabled: bool = True
     classification_enabled: bool = False
     instance_segmentation_enabled: bool = False
@@ -64,22 +63,19 @@ class ProjectConfig:
         """Serialize config to JSON string."""
         data = dict(self.extra)
         data.update({k: v for k, v in self.__dict__.items() if k != "extra"})
-        if data["embed_threshold_kb"] is None:
-            data["embed_threshold_kb"] = 100
         return json.dumps(data)
 
     @classmethod
     def from_json(cls, json_str: str) -> "ProjectConfig":
         """Deserialize config from JSON string."""
         data = json.loads(json_str)
+        data.pop("embed_threshold_kb", None)  # retired: not carried along
         known = {f for f in cls.__dataclass_fields__ if f != "extra"}
         config = cls(**{k: v for k, v in data.items() if k in known})
         config.extra = {k: v for k, v in data.items() if k not in known}
         # Absent or null means every supported format: the images, for Python.
         if config.extensions is None:
             config.extensions = list(IMAGE_EXTENSIONS)
-        if config.embed_threshold_kb is None:
-            config.embed_threshold_kb = 100
         return config
 
 
