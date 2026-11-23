@@ -4,6 +4,7 @@ import zmq
 import msgpack
 
 from . import decorators, masks, params
+from .types import Result
 
 # 2: segmentation ops, and `functions` in the ping reply.
 PROTOCOL_VERSION = 2
@@ -34,9 +35,17 @@ def _extras(entry, msg: dict, current_masks) -> dict:
         "labels": list(msg["labels"]),
         "active_label": msg.get("active_label"),
         "frame_index": msg.get("frame_index"),
+        "frame_name": msg.get("frame_name"),
     }
     extras = {k: (v() if callable(v) else v) for k, v in available.items() if k in entry.wants}
     return {**extras, **params.resolve(entry.params, msg.get("args"))}
+
+
+def _unwrap(result) -> tuple:
+    """The masks a function returned, and the reply fields for its message."""
+    if not isinstance(result, Result):
+        return result, {}
+    return result.masks, {"message": str(result.message)} if result.message else {}
 
 
 def _segment(msg: dict) -> dict:
@@ -54,9 +63,9 @@ def _segment(msg: dict) -> dict:
         sent = _decode_masks(msg.get("masks"))
         return {l: sent[l].copy() if l in sent else np.zeros(hw, np.uint8) for l in labels}
 
-    result = entry.fn(image, **_extras(entry, msg, current_masks))
+    result, note = _unwrap(entry.fn(image, **_extras(entry, msg, current_masks)))
     layers, unknown = masks.frame_layers(result, labels)
-    return {"ok": True, "masks": masks.encode(layers, 0, hw), "unknown": unknown}
+    return {"ok": True, "masks": masks.encode(layers, 0, hw), "unknown": unknown, **note}
 
 
 def _seq_begin(msg: dict) -> dict:
@@ -103,10 +112,10 @@ def _seq_run() -> dict:
     extras = _extras(entry, begin, current_masks)
     _SESSION["frames"] = _SESSION["masks"] = None  # the function owns them now
 
-    result = entry.fn(stacked, **extras)
+    result, note = _unwrap(entry.fn(stacked, **extras))
     layers, unknown = masks.sequence_layers(result, labels, len(shapes))
     _SESSION.update(layers=layers, shapes=shapes)
-    return {"ok": True, "unknown": unknown}
+    return {"ok": True, "unknown": unknown, **note}
 
 
 def _seq_result(msg: dict) -> dict:

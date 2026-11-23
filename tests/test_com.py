@@ -8,6 +8,7 @@ from didascalie.com import (
     Enum,
     Float,
     Int,
+    Result,
     decorators,
     register_kpts,
     register_seg,
@@ -327,3 +328,44 @@ def test_bad_declarations_fail_at_decoration(declared, match):
 def test_bad_types_fail_when_built(build):
     with pytest.raises(ValueError):
         build()
+
+
+def test_frame_name_is_passed_when_declared():
+    seen = {}
+
+    @register_seg
+    def f(image, frame_name):
+        seen["name"] = frame_name
+
+    assert segment("f", frame_name="sub/a.png")["ok"] and seen["name"] == "sub/a.png"
+    # An older Didascalie does not send it.
+    assert segment("f")["ok"] and seen["name"] is None
+
+
+def test_result_carries_a_message_with_or_without_masks():
+    @register_seg
+    def note(image):
+        return Result(message="Saved 3 fibers")
+
+    @register_seg
+    def both(image):
+        return Result({"vessel": np.ones((H, W), bool)}, message="Done")
+
+    assert segment("note") == {"ok": True, "masks": [], "unknown": [],
+                               "message": "Saved 3 fibers"}
+    reply = segment("both")
+    assert reply["message"] == "Done" and [m["label"] for m in reply["masks"]] == ["vessel"]
+
+
+def test_sequence_result_carries_a_message():
+    @register_sequence_seg
+    def track(frames, frame_name):
+        return Result(frames[..., 0] > 0, message=f"From {frame_name}")
+
+    assert call({"op": "seq_begin", "name": "track", "n_frames": 1, "labels": LABELS,
+                 "active_label": "disc", "frame_index": 0, "frame_name": "a.png"})["ok"]
+    assert call({"op": "seq_frame", "index": 0,
+                 "image": payload(np.ones((H, W, 3), np.uint8))})["ok"]
+    run = call({"op": "seq_run"})
+    assert run["ok"] and run["message"] == "From a.png"
+    assert mask_of(call({"op": "seq_result", "index": 0})["masks"][0]).sum() == H * W

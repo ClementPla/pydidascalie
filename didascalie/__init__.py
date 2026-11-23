@@ -41,7 +41,7 @@ from .models import (
 )
 from .vector import VectorNode, VectorShape, rasterize
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     "DidascalieProject",
     "LabelMedProject",  # deprecated alias

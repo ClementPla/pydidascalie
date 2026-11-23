@@ -12,7 +12,7 @@ SEQUENCE_SEG = "sequence_seg"
 # What Didascalie can hand to a segmentation function besides the image. A
 # function opts in by naming the parameter, so nothing is transferred unless
 # it is asked for.
-SEG_EXTRAS = ("masks", "labels", "active_label", "frame_index")
+SEG_EXTRAS = ("masks", "labels", "active_label", "frame_index", "frame_name")
 
 
 @dataclass
@@ -131,6 +131,7 @@ def register_seg(name: str | None = None, /, **params: Param):
         labels:       list of the project's label names, in order
         active_label: name of the label selected in the editor, or None
         frame_index:  index of the frame in its sequence
+        frame_name:   its file path within the project, or None
 
     Keyword arguments of the decorator declare values the user sets in
     Didascalie, each passed to the parameter of that name:
@@ -143,6 +144,7 @@ def register_seg(name: str | None = None, /, **params: Param):
         {label name: H×W mask}   replaces those labels
         C×H×W array              one mask per project label, in order
         H×W array                drawn onto the active label
+        Result(masks, message=)  any of these, and a message to show
 
     Masks may be bool, float (thresholded at 0.5) or integer (kept as is, for
     instance ids). Torch tensors are accepted.
@@ -157,13 +159,15 @@ def register_sequence_seg(name: str | None = None, /, **params: Param):
     Same contract as `register_seg` with a leading frame axis: the first
     parameter receives T×H×W×3 uint8 (a list of H×W×3 arrays when the frames
     differ in size), `masks` is {label name: T×H×W}, and `frame_index` is the
-    position, within the frames received, of the frame open in the editor.
+    position, within the frames received, of the frame open in the editor, and
+    `frame_name` the name of that frame.
     Arguments are declared as for `register_seg`.
 
     Return one of:
         {label name: T×H×W}   replaces those labels on every frame
         T×C×H×W array         one mask per project label, in order
         T×H×W array           drawn onto the active label of every frame
+        Result(masks, message=)  any of these, and a message to show
     """
     return _decorator(SEQUENCE_SEG, name, params)
 
